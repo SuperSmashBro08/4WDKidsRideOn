@@ -1,0 +1,39 @@
+Microcontroller Teensy 4.1 pin assignment
+// ==== Outputs / ==== 3x motor drivers
+
+// ====  M1 Steering (BTS7960) ====
+#define PIN_STEER_REN    15  PIN 3 to U5 pin 18 1y1 out 1a1 to pin 15
+#define PIN_STEER_LEN    16  PIN 4 to U5 pin 16 1y2 out 1a2 to pin 16
+#define PIN_STEER_RPWM   17  PIN 5 to U5 pin 14 1y3 out 1a3 to pin 17
+#define PIN_STEER_LPWM   18  PIN 6 to U5 pin 12 1y4 out 1a4 to pin 18
+
+// ==== M2 Front Motors (BTS7960) ====
+#define PIN_FRONT_REN    19  PIN 3 to U4 pin 9 2y1 out 2a1 to pin 19
+#define PIN_FRONT_FEN    20  PIN 4 to U4 pin 7 2y2 out 2a2 to pin 20
+#define PIN_FRONT_FPWM   21  PIN 5 to U4 pin 5 2y3 out 2a3 to pin 21
+#define PIN_FRONT_RPWM   22  PIN 6 to U4 pin 3 2y4 out 2a4 to pin 22
+
+// ==== M3 Rear Motors (BTS7960) ====
+#define PIN_REAR_REN     23  PIN 3 to U4 pin 12 1y4 out 1a4 to pin 23
+#define PIN_REAR_FEN     24  PIN 4 to U4 pin 14 1y3 out 1a3 to pin 24
+#define PIN_REAR_FPWM    25  PIN 5 to U4 pin 16 1y2 out 1a2 to pin 25
+#define PIN_REAR_RPWM    26  PIN 6 to U4 pin 18 1y1 out 1a1 to pin 26
+
+// ==== Inputs / ====
+Car Steering Wheel Potentiometer 
+#define PIN_STEERING1    27 to pin 3 on J4
+
+Rotary Encoder AMT102v Car Gearbox
+#define PIN_ENC_A        0 to PIN 6 3Y then Pin 7 3A to pin 3 on J6
+#define PIN_ENC_B        1 to PIN 4 2Y then Pin 5 2A to pin 4 on J6
+#define PIN_ENC_X        2 to PIN 2 1Y then Pin 3 1A to pin 5 on J6
+
+Car Foot Pedal (Throttle Potentiometer)
+#define PIN_THROTTLE1    3 to pin 3 on J3
+
+Remote Control Inputs
+#define PIN_THROTTLE2    4 to PIN 15 6Y then Pin 14 6A to pin 3 on J5
+#define PIN_STEERING2    5 to PIN 12 5Y then Pin 11 5A to pin 4 on J5
+
+
+
