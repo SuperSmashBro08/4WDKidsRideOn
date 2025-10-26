@@ -297,6 +297,8 @@ static void handleUpload() {
     // 2) Stream HEX now
     String result = streamHexFromFS("/teensy41.hex");
 
+    if (!uploadedWasHex) otaActive = false;  // normally cleared by streamHex
+
     Serial.println("[RESULT]\n" + hello + result);
 
     // 3) Redirect back to "/"
