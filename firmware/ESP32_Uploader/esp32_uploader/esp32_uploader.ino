@@ -3,8 +3,9 @@
  * ------------------------------------------------------------------
  * Wiring: ESP32 GPIO43 (TX) → Teensy RX2 pin 7, GPIO44 (RX) ← Teensy TX2 pin 8, common GND.
  * Telnet:  `telnet <esp32-ip> 2323` (up to 3 clients share the same raw UART stream).
- * Quick test: connect via Telnet, type `VERSION` and expect the Teensy reply; run `POT ON`
- *            then move the potentiometer to see live `POT:` lines; send `POT OFF` to stop.
+ * Quick test: connect via Telnet, type `VERSION` and expect the Teensy reply; run `STREAM ON`
+ *            (or `POT ON`) then move the potentiometer to see live `POT raw=... pct=...` lines;
+ *            send `STREAM OFF`/`POT OFF` to stop.
  * OTA: open the ESP32 web page, upload a Teensy `.hex`, wait for `HEX OK`/`APPLIED`; the
  *      Telnet bridge pauses automatically during OTA and resumes afterwards.
  */
@@ -304,12 +305,25 @@ static void telnetAcceptClients() {
   WiFiClient newClient = telnetServer.available();
   if (!newClient) return;
 
+  IPAddress newIP = newClient.remoteIP();
+  uint16_t newPort = newClient.remotePort();
+
+  // Replace any existing slot from the same remote endpoint
+  for (int i = 0; i < MAX_TELNET_CLIENTS; i++) {
+    if (telnetClients[i] && telnetClients[i].connected()) {
+      if (telnetClients[i].remoteIP() == newIP && telnetClients[i].remotePort() == newPort) {
+        telnetClients[i].stop();
+        telnetClients[i] = newClient;
+        return;
+      }
+    }
+  }
+
   int slot = -1;
   for (int i = 0; i < MAX_TELNET_CLIENTS; i++) {
     if (!telnetClients[i] || !telnetClients[i].connected()) { slot = i; break; }
   }
   if (slot >= 0) {
-    telnetClients[slot].stop();
     telnetClients[slot] = newClient;
   } else {
     newClient.println("[ESP32] Too many telnet clients.");
@@ -323,7 +337,14 @@ static void telnetBroadcastFromTeensy() {
   if (!avail) return;
 
   uint8_t buf[512];
-  int n = SerialTeensy.readBytes(buf, min(avail, (int)sizeof(buf)));
+  int n = 0;
+  int limit = min(avail, (int)sizeof(buf));
+  while (n < limit) {
+    int c = SerialTeensy.read();
+    if (c < 0) break;
+    buf[n++] = (uint8_t)c;
+  }
+  if (!n) return;
   for (int i = 0; i < MAX_TELNET_CLIENTS; i++) {
     if (telnetClients[i] && telnetClients[i].connected()) {
       telnetClients[i].write(buf, n);  // raw bytes out
