@@ -6,7 +6,8 @@
  * Quick test: connect via Telnet, type `VERSION` and expect the Teensy reply; run `STREAM ON`
  *            (or `POT ON`) then move the potentiometer to see live `POT raw=... pct=...` lines;
  *            send `STREAM OFF`/`POT OFF` to stop.
- * OTA: open the ESP32 web page, upload a Teensy `.hex`, wait for `HEX OK`/`APPLIED`; the
+ * OTA: open the ESP32 web page, upload the Teensy-exported **Intel HEX** (`.hex`), wait for
+ *      `HEX OK`/`APPLIED`; the
  *      Telnet bridge pauses automatically during OTA and resumes afterwards.
  */
 
@@ -47,8 +48,8 @@ static const char* PAGE_INDEX =
 "<h2>ESP32 → Teensy OTA</h2>"
 "<div class=card>"
 "<form method='POST' action='/upload' enctype='multipart/form-data'>"
-"<p><b>Upload Teensy firmware</b> (<code>.hex</code> preferred)</p>"
-"<input type='file' name='firmware' accept='.hex,.bin' required>"
+"<p><b>Upload Teensy firmware</b> (<code>.hex</code> only — use <i>Sketch → Export compiled Binary</i>)</p>"
+"<input type='file' name='firmware' accept='.hex' required>"
 "<button type='submit'>Upload & Flash</button></form>"
 "</div>"
 "<div class=card>"
@@ -279,15 +280,22 @@ static void handleUpload() {
     uploadFile.close();
     Serial.printf("[HTTP] Upload complete: %s bytes=%u\n", lastUploadName.c_str(), up.totalSize);
 
+    if (!uploadedWasHex) {
+      Serial.println("[HTTP] Rejecting non-hex upload — OTA requires Intel HEX output.");
+      LittleFS.remove("/teensy41.bin");
+      server.send(415, "text/plain",
+                  "Upload rejected. Please send the Teensy Intel HEX (.hex) produced by"
+                  " 'Export compiled Binary'.");
+      return;
+    }
+
     otaActive = true;  // pause Telnet bridge for HELLO + flashing
 
     // 1) HELLO
     String hello = sendHelloAndWait(2500);
 
-    // 2) Stream HEX now (.bin just stored)
-    String result;
-    if (uploadedWasHex) result = streamHexFromFS("/teensy41.hex");
-    else                result = "BIN saved as /teensy41.bin — Teensy stub expects .hex.\n";
+    // 2) Stream HEX now
+    String result = streamHexFromFS("/teensy41.hex");
 
     if (!uploadedWasHex) otaActive = false;  // normally cleared by streamHex
 

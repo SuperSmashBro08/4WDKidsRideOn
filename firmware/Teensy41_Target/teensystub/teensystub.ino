@@ -17,7 +17,7 @@ static constexpr uint8_t LED_PIN    = 13;
 static constexpr uint32_t BAUD_USB  = 115200;   // Serial (USB) to PC
 static constexpr uint32_t BAUD_UART = 115200;   // Serial2 (pins 7/8) to ESP32
 static constexpr char OTA_TOKEN[]   = "8d81ab8762c545dabe699044766a0b72";
-static constexpr char FW_VERSION[]  = "fw-raw-bridge-demo2";
+static constexpr char FW_VERSION[]  = "fw-raw-bridge-demo";
 static constexpr uint8_t POT_PIN    = A0;
 
 // ------------------------- IO helpers -------------------------
@@ -227,8 +227,10 @@ void loop() {
         netln("HEX IDLE");
       } else {
         in_hex_session = false;
-        echo_enabled = echo_resume_after_hex;
-        stream_enabled = stream_resume_after_hex;
+
+        bool resume_echo = echo_resume_after_hex;
+        bool resume_stream = stream_resume_after_hex;
+
         echo_resume_after_hex = false;
         stream_resume_after_hex = false;
         ota_suspend_armed = false;
@@ -241,8 +243,15 @@ void loop() {
           blink_ms = 87;
           netln("APPLIED");
           Serial.println("[Teensy] GOODBYE — OTA transfer verified ✔");
+
+          // Keep echo disabled after a successful OTA so the console comes back quiet
+          // (fresh firmware or the stub both start from a non-echoing state).
+          echo_enabled = false;
+          stream_enabled = resume_stream;
         } else {
           NET.printf("HEX ERR lines=%lu bad=%lu\n", hex_lines, hex_bad);
+          echo_enabled = resume_echo;
+          stream_enabled = resume_stream;
         }
       }
     }
