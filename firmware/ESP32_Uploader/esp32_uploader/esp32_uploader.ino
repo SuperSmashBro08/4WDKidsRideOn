@@ -1,3 +1,16 @@
+/*
+ * ESP32-S3 OTA uploader + transparent Telnet ↔ Teensy Serial2 bridge
+ * ------------------------------------------------------------------
+ * Wiring: ESP32 GPIO43 (TX) → Teensy RX2 pin 7, GPIO44 (RX) ← Teensy TX2 pin 8, common GND.
+ * Telnet:  `telnet <esp32-ip> 2323` (up to 3 clients share the same raw UART stream).
+ * Quick test: connect via Telnet, type `VERSION` and expect the Teensy reply; run `STREAM ON`
+ *            (or `POT ON`) then move the potentiometer to see live `POT raw=... pct=...` lines;
+ *            send `STREAM OFF`/`POT OFF` to stop.
+ * OTA: open the ESP32 web page, upload the Teensy-exported **Intel HEX** (`.hex`), wait for
+ *      `HEX OK`/`APPLIED`; the
+ *      Telnet bridge pauses automatically during OTA and resumes afterwards.
+ */
+
 #include <WiFi.h>
 #include <WebServer.h>
 #include <LittleFS.h>
@@ -21,8 +34,8 @@ WiFiClient telnetClients[MAX_TELNET_CLIENTS];
 // Pauses Telnet bridge while OTA owns the UART
 volatile bool otaActive = false;
 
-// ---------------- HTML ----------------
-static const char* PAGE_INDEX =
+// ---------------- HTML helpers ----------------
+static const char HTML_HEAD[] PROGMEM =
 "<!doctype html><html><head><meta charset='utf-8'>"
 "<meta name=viewport content='width=device-width,initial-scale=1'/>"
 "<title>ESP32 → Teensy OTA</title>"
@@ -31,22 +44,80 @@ static const char* PAGE_INDEX =
 "button{padding:.6em 1em;border-radius:8px;border:1px solid #888;background:#fafafa;cursor:pointer}"
 "a{color:#06c;text-decoration:none}a:hover{text-decoration:underline}"
 ".card{border:1px solid #ddd;border-radius:12px;padding:16px;margin-bottom:16px}"
-"</style></head><body>"
-"<h2>ESP32 → Teensy OTA</h2>"
-"<div class=card>"
-"<form method='POST' action='/upload' enctype='multipart/form-data'>"
-"<p><b>Upload Teensy firmware</b> (<code>.hex</code> preferred)</p>"
-"<input type='file' name='firmware' accept='.hex,.bin' required>"
-"<button type='submit'>Upload & Flash</button></form>"
-"</div>"
-"<div class=card>"
-"<p>Telnet monitor: <b>telnet</b> <code>ESP32-IP</code> <b>2323</b></p>"
-"<p>mDNS (if supported): <code>telnet esp32-teensy.local 2323</code></p>"
-"</div>"
-"<div class=card>"
-"<p><a href='/ls'>List LittleFS</a> · <a href='/health'>Health</a> · <a href='/reboot'>Reboot ESP32</a></p>"
-"</div>"
-"</body></html>";
+".success{color:#0a0;font-weight:600}"
+".error{color:#b00;font-weight:600}"
+"pre{background:#f6f8fa;padding:12px;border-radius:10px;overflow-x:auto}"
+"</style></head><body><h2>ESP32 → Teensy OTA</h2>";
+
+static const char HTML_FOOT[] PROGMEM = "</body></html>";
+
+static String lastOtaLog;
+static bool   lastOtaSuccess = false;
+static unsigned long lastOtaMillis = 0;
+
+static String htmlEscape(const String& in) {
+  String out;
+  out.reserve(in.length() + 16);
+  for (size_t i = 0; i < in.length(); ++i) {
+    char c = in.charAt(i);
+    switch (c) {
+      case '&': out += F("&amp;"); break;
+      case '<': out += F("&lt;");  break;
+      case '>': out += F("&gt;");  break;
+      default:  out += c;         break;
+    }
+  }
+  return out;
+}
+
+static void appendSharedCards(String& page) {
+  page += F("<div class=card><form method='POST' action='/upload' enctype='multipart/form-data'>");
+  page += F("<p><b>Upload Teensy firmware</b> (<code>.hex</code> only — use <i>Sketch → Export compiled Binary</i>)</p>");
+  page += F("<input type='file' name='firmware' accept='.hex' required>");
+  page += F("<button type='submit'>Upload & Flash</button></form></div>");
+  page += F("<div class=card><p>Telnet monitor: <b>telnet</b> <code>ESP32-IP</code> <b>2323</b></p>");
+  page += F("<p>mDNS (if supported): <code>telnet esp32-teensy.local 2323</code></p></div>");
+  page += F("<div class=card><p><a href='/ls'>List LittleFS</a> · <a href='/health'>Health</a> · <a href='/reboot'>Reboot ESP32</a></p></div>");
+}
+
+static String buildIndexPage() {
+  String page;
+  page.reserve(2048);
+  page += FPSTR(HTML_HEAD);
+  appendSharedCards(page);
+  if (lastOtaLog.length()) {
+    page += F("<div class=card><h3>Last OTA result</h3>");
+    page += lastOtaSuccess ? F("<p class=success>Success</p>") : F("<p class=error>Failed</p>");
+    page += F("<p><small>");
+    if (lastOtaMillis) {
+      page += F("Completed ");
+      page += String((millis() - lastOtaMillis) / 1000);
+      page += F(" s ago</small></p>");
+    } else {
+      page += F("Status recorded.</small></p>");
+    }
+    page += F("<pre>");
+    page += htmlEscape(lastOtaLog);
+    page += F("</pre></div>");
+  }
+  page += FPSTR(HTML_FOOT);
+  return page;
+}
+
+static String buildResultPage(bool success, const String& log) {
+  String page;
+  page.reserve(2048 + log.length());
+  page += FPSTR(HTML_HEAD);
+  page += success ? F("<div class=card><h3 class=success>OTA upload complete</h3>")
+                  : F("<div class=card><h3 class=error>OTA upload failed</h3>");
+  page += F("<p><a href='/'>Back to uploader</a></p>");
+  page += F("<pre>");
+  page += htmlEscape(log);
+  page += F("</pre></div>");
+  appendSharedCards(page);
+  page += FPSTR(HTML_FOOT);
+  return page;
+}
 
 // ---------------- FS ----------------
 static void ensureLittleFS() {
@@ -54,7 +125,7 @@ static void ensureLittleFS() {
   else                       Serial.println("[FS] LittleFS mounted.");
 }
 
-static void handleRoot() { server.send(200, "text/html", PAGE_INDEX); }
+static void handleRoot() { server.send(200, "text/html", buildIndexPage()); }
 
 static void handleListFS() {
   String html = "<h3>LittleFS contents</h3><pre>";
@@ -130,20 +201,27 @@ static String readLineFromTeensy(uint32_t wait_ms) {
   return String();
 }
 
-static String sendHelloAndWait(uint32_t timeout_ms = 2000) {
+static String sendHelloAndWait(bool* readyOut, uint32_t timeout_ms = 2000) {
   while (SerialTeensy.available()) SerialTeensy.read();
   SerialTeensy.print("HELLO "); SerialTeensy.print(OTA_TOKEN); SerialTeensy.print("\n");
   Serial.println("[UART] Sent: HELLO <token>");
 
   String log, line; unsigned long t0 = millis();
+  bool sawReady = false;
   while (millis() - t0 < timeout_ms) {
     line = readLineFromTeensy(50);
     if (line.length()) {
       Serial.printf("[UART] <- %s\n", line.c_str());
       log += line + "\n";
-      if (line == "READY" || line == "NACK" || line == "DONE") break;
+      if (line == "READY") {
+        sawReady = true;
+      }
+      if (line == "NACK" || line == "DONE") {
+        break;
+      }
     }
   }
+  if (readyOut) *readyOut = sawReady;
   return log.length() ? log : String("No response within timeout\n");
 }
 
@@ -267,19 +345,48 @@ static void handleUpload() {
     uploadFile.close();
     Serial.printf("[HTTP] Upload complete: %s bytes=%u\n", lastUploadName.c_str(), up.totalSize);
 
-    // 1) HELLO
-    String hello = sendHelloAndWait(2500);
+    if (!uploadedWasHex) {
+      Serial.println("[HTTP] Rejecting non-hex upload — OTA requires Intel HEX output.");
+      LittleFS.remove("/teensy41.bin");
+      server.send(415, "text/plain",
+                  "Upload rejected. Please send the Teensy Intel HEX (.hex) produced by"
+                  " 'Export compiled Binary'.");
+      return;
+    }
 
-    // 2) Stream HEX now (.bin just stored)
-    String result;
-    if (uploadedWasHex) result = streamHexFromFS("/teensy41.hex");
-    else                result = "BIN saved as /teensy41.bin — Teensy stub expects .hex.\n";
+    otaActive = true;  // pause Telnet bridge for HELLO + flashing
 
-    Serial.println("[RESULT]\n" + hello + result);
+    bool helloReady = false;
+    String hello = sendHelloAndWait(&helloReady, 2500);
 
-    // 3) Redirect back to "/"
-    server.sendHeader("Location", "/");
-    server.send(303);
+    if (!helloReady) {
+      otaActive = false;
+      String summary = String("HELLO handshake failed\n");
+      if (hello.length()) summary += hello;
+      else summary += F("No HELLO response\n");
+      Serial.println("[RESULT]\n" + summary);
+      lastOtaSuccess = false;
+      lastOtaLog = summary;
+      lastOtaMillis = millis();
+      server.send(500, "text/html", buildResultPage(false, summary));
+      return;
+    }
+
+    // Stream HEX now
+    String result = streamHexFromFS("/teensy41.hex");
+    String combined = hello + result;
+
+    otaActive = false;  // ensure Telnet bridge resumes even if stream exited early
+
+    bool success = (result.indexOf("HEX OK") >= 0 && result.indexOf("HEX ERR") < 0 && result.indexOf("Aborted") < 0);
+
+    Serial.println("[RESULT]\n" + combined);
+
+    lastOtaSuccess = success;
+    lastOtaLog = combined;
+    lastOtaMillis = millis();
+
+    server.send(success ? 200 : 500, "text/html", buildResultPage(success, combined));
   }
 }
 
@@ -289,14 +396,26 @@ static void telnetAcceptClients() {
   WiFiClient newClient = telnetServer.available();
   if (!newClient) return;
 
+  IPAddress newIP = newClient.remoteIP();
+  uint16_t newPort = newClient.remotePort();
+
+  // Replace any existing slot from the same remote endpoint
+  for (int i = 0; i < MAX_TELNET_CLIENTS; i++) {
+    if (telnetClients[i] && telnetClients[i].connected()) {
+      if (telnetClients[i].remoteIP() == newIP && telnetClients[i].remotePort() == newPort) {
+        telnetClients[i].stop();
+        telnetClients[i] = newClient;
+        return;
+      }
+    }
+  }
+
   int slot = -1;
   for (int i = 0; i < MAX_TELNET_CLIENTS; i++) {
     if (!telnetClients[i] || !telnetClients[i].connected()) { slot = i; break; }
   }
   if (slot >= 0) {
-    telnetClients[slot].stop();
     telnetClients[slot] = newClient;
-    newClient.print("\r\n[ESP32] Telnet connected. Raw bridge to Teensy Serial2.\r\n");
   } else {
     newClient.println("[ESP32] Too many telnet clients.");
     newClient.stop();
@@ -309,7 +428,14 @@ static void telnetBroadcastFromTeensy() {
   if (!avail) return;
 
   uint8_t buf[512];
-  int n = SerialTeensy.readBytes(buf, min(avail, (int)sizeof(buf)));
+  int n = 0;
+  int limit = min(avail, (int)sizeof(buf));
+  while (n < limit) {
+    int c = SerialTeensy.read();
+    if (c < 0) break;
+    buf[n++] = (uint8_t)c;
+  }
+  if (!n) return;
   for (int i = 0; i < MAX_TELNET_CLIENTS; i++) {
     if (telnetClients[i] && telnetClients[i].connected()) {
       telnetClients[i].write(buf, n);  // raw bytes out
