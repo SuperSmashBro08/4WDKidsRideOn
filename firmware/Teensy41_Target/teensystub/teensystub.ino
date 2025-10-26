@@ -174,9 +174,16 @@ void loop() {
     cmd.toUpperCase();
 
     // ================= OTA handshake =================
-    if (cmd.startsWith("HELLO ")) {
-      String tok = line.substring(6);
-      if (tok == OTA_TOKEN) {
+    if (cmd.startsWith("HELLO")) {
+      int spacePos = line.indexOf(' ');
+      String tok = (spacePos >= 0) ? line.substring(spacePos + 1) : String();
+      tok.trim();
+
+      if (!tok.length()) {
+        Serial.println("[Teensy] HELLO missing token");
+        netln("NACK");
+      }
+      else if (tok == OTA_TOKEN) {
         Serial.println("[Teensy] HELLO OK");
         echo_resume_after_hex = echo_enabled;
         stream_resume_after_hex = stream_enabled;
