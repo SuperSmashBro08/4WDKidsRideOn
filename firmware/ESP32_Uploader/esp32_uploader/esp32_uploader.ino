@@ -1,3 +1,16 @@
+/*
+ * ESP32-S3 OTA uploader + transparent Telnet ↔ Teensy Serial2 bridge
+ * ------------------------------------------------------------------
+ * Wiring: ESP32 GPIO43 (TX) → Teensy RX2 pin 7, GPIO44 (RX) ← Teensy TX2 pin 8, common GND.
+ * Telnet:  `telnet <esp32-ip> 2323` (up to 3 clients share the same raw UART stream).
+ * Quick test: connect via Telnet, type `VERSION` and expect the Teensy reply; run `STREAM ON`
+ *            (or `POT ON`) then move the potentiometer to see live `POT raw=... pct=...` lines;
+ *            send `STREAM OFF`/`POT OFF` to stop.
+ * OTA: open the ESP32 web page, upload the Teensy-exported **Intel HEX** (`.hex`), wait for
+ *      `HEX OK`/`APPLIED`; the
+ *      Telnet bridge pauses automatically during OTA and resumes afterwards.
+ */
+
 #include <WiFi.h>
 #include <WebServer.h>
 #include <LittleFS.h>
@@ -35,8 +48,8 @@ static const char* PAGE_INDEX =
 "<h2>ESP32 → Teensy OTA</h2>"
 "<div class=card>"
 "<form method='POST' action='/upload' enctype='multipart/form-data'>"
-"<p><b>Upload Teensy firmware</b> (<code>.hex</code> preferred)</p>"
-"<input type='file' name='firmware' accept='.hex,.bin' required>"
+"<p><b>Upload Teensy firmware</b> (<code>.hex</code> only — use <i>Sketch → Export compiled Binary</i>)</p>"
+"<input type='file' name='firmware' accept='.hex' required>"
 "<button type='submit'>Upload & Flash</button></form>"
 "</div>"
 "<div class=card>"
@@ -267,13 +280,22 @@ static void handleUpload() {
     uploadFile.close();
     Serial.printf("[HTTP] Upload complete: %s bytes=%u\n", lastUploadName.c_str(), up.totalSize);
 
+    if (!uploadedWasHex) {
+      Serial.println("[HTTP] Rejecting non-hex upload — OTA requires Intel HEX output.");
+      LittleFS.remove("/teensy41.bin");
+      server.send(415, "text/plain",
+                  "Upload rejected. Please send the Teensy Intel HEX (.hex) produced by"
+                  " 'Export compiled Binary'.");
+      return;
+    }
+
+    otaActive = true;  // pause Telnet bridge for HELLO + flashing
+
     // 1) HELLO
     String hello = sendHelloAndWait(2500);
 
-    // 2) Stream HEX now (.bin just stored)
-    String result;
-    if (uploadedWasHex) result = streamHexFromFS("/teensy41.hex");
-    else                result = "BIN saved as /teensy41.bin — Teensy stub expects .hex.\n";
+    // 2) Stream HEX now
+    String result = streamHexFromFS("/teensy41.hex");
 
     Serial.println("[RESULT]\n" + hello + result);
 
@@ -289,14 +311,26 @@ static void telnetAcceptClients() {
   WiFiClient newClient = telnetServer.available();
   if (!newClient) return;
 
+  IPAddress newIP = newClient.remoteIP();
+  uint16_t newPort = newClient.remotePort();
+
+  // Replace any existing slot from the same remote endpoint
+  for (int i = 0; i < MAX_TELNET_CLIENTS; i++) {
+    if (telnetClients[i] && telnetClients[i].connected()) {
+      if (telnetClients[i].remoteIP() == newIP && telnetClients[i].remotePort() == newPort) {
+        telnetClients[i].stop();
+        telnetClients[i] = newClient;
+        return;
+      }
+    }
+  }
+
   int slot = -1;
   for (int i = 0; i < MAX_TELNET_CLIENTS; i++) {
     if (!telnetClients[i] || !telnetClients[i].connected()) { slot = i; break; }
   }
   if (slot >= 0) {
-    telnetClients[slot].stop();
     telnetClients[slot] = newClient;
-    newClient.print("\r\n[ESP32] Telnet connected. Raw bridge to Teensy Serial2.\r\n");
   } else {
     newClient.println("[ESP32] Too many telnet clients.");
     newClient.stop();
@@ -309,7 +343,14 @@ static void telnetBroadcastFromTeensy() {
   if (!avail) return;
 
   uint8_t buf[512];
-  int n = SerialTeensy.readBytes(buf, min(avail, (int)sizeof(buf)));
+  int n = 0;
+  int limit = min(avail, (int)sizeof(buf));
+  while (n < limit) {
+    int c = SerialTeensy.read();
+    if (c < 0) break;
+    buf[n++] = (uint8_t)c;
+  }
+  if (!n) return;
   for (int i = 0; i < MAX_TELNET_CLIENTS; i++) {
     if (telnetClients[i] && telnetClients[i].connected()) {
       telnetClients[i].write(buf, n);  // raw bytes out
