@@ -17,7 +17,7 @@ static constexpr uint8_t LED_PIN    = 13;
 static constexpr uint32_t BAUD_USB  = 115200;   // Serial (USB) to PC
 static constexpr uint32_t BAUD_UART = 115200;   // Serial2 (pins 7/8) to ESP32
 static constexpr char OTA_TOKEN[]   = "8d81ab8762c545dabe699044766a0b72";
-static constexpr char FW_VERSION[]  = "fw-raw-bridge-demo";
+static constexpr char FW_VERSION[]  = "fw-raw-bridge-demo2";
 static constexpr uint8_t POT_PIN    = A0;
 
 // ------------------------- IO helpers -------------------------

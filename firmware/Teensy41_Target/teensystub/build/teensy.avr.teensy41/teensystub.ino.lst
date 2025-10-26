@@ -1844,7 +1844,7 @@ Disassembly of section .text.itcm:
       ea:	210d      	movs	r1, #13
       ec:	4815      	ldr	r0, [pc, #84]	; (144 <setup+0xc8>)
       ee:	f003 f919 	bl	3324 <usb_serial_write>
-      f2:	2112      	movs	r1, #18
+      f2:	2113      	movs	r1, #19
       f4:	4814      	ldr	r0, [pc, #80]	; (148 <setup+0xcc>)
       f6:	f003 f915 	bl	3324 <usb_serial_write>
       fa:	4811      	ldr	r0, [pc, #68]	; (140 <setup+0xc4>)
