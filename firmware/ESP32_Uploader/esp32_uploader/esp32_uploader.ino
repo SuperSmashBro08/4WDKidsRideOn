@@ -1,3 +1,14 @@
+/*
+ * ESP32-S3 OTA uploader + transparent Telnet ↔ Teensy Serial2 bridge
+ * ------------------------------------------------------------------
+ * Wiring: ESP32 GPIO43 (TX) → Teensy RX2 pin 7, GPIO44 (RX) ← Teensy TX2 pin 8, common GND.
+ * Telnet:  `telnet <esp32-ip> 2323` (up to 3 clients share the same raw UART stream).
+ * Quick test: connect via Telnet, type `VERSION` and expect the Teensy reply; run `POT ON`
+ *            then move the potentiometer to see live `POT:` lines; send `POT OFF` to stop.
+ * OTA: open the ESP32 web page, upload a Teensy `.hex`, wait for `HEX OK`/`APPLIED`; the
+ *      Telnet bridge pauses automatically during OTA and resumes afterwards.
+ */
+
 #include <WiFi.h>
 #include <WebServer.h>
 #include <LittleFS.h>
@@ -267,6 +278,8 @@ static void handleUpload() {
     uploadFile.close();
     Serial.printf("[HTTP] Upload complete: %s bytes=%u\n", lastUploadName.c_str(), up.totalSize);
 
+    otaActive = true;  // pause Telnet bridge for HELLO + flashing
+
     // 1) HELLO
     String hello = sendHelloAndWait(2500);
 
@@ -274,6 +287,8 @@ static void handleUpload() {
     String result;
     if (uploadedWasHex) result = streamHexFromFS("/teensy41.hex");
     else                result = "BIN saved as /teensy41.bin — Teensy stub expects .hex.\n";
+
+    if (!uploadedWasHex) otaActive = false;  // normally cleared by streamHex
 
     Serial.println("[RESULT]\n" + hello + result);
 
@@ -296,7 +311,6 @@ static void telnetAcceptClients() {
   if (slot >= 0) {
     telnetClients[slot].stop();
     telnetClients[slot] = newClient;
-    newClient.print("\r\n[ESP32] Telnet connected. Raw bridge to Teensy Serial2.\r\n");
   } else {
     newClient.println("[ESP32] Too many telnet clients.");
     newClient.stop();
