@@ -125,16 +125,15 @@ static String readLineFromTeensy(uint32_t wait_ms) {
       if (c == '\r') continue;
       if (c == '\n') {
         line.trim();
-        if (line.length()) return line;
-        line = "";
-        continue;
+        return line;
       }
-      if (line.length() < 120) line += c;
+      if (line.length() < 200) line += c;
     }
     delay(1);
     yield();
   }
-  return String();
+  line.trim();
+  return line;
 }
 
 static bool flashTeensyFromFS(const char* path, String& logOut) {
@@ -151,21 +150,42 @@ static bool flashTeensyFromFS(const char* path, String& logOut) {
 
   while (SerialTeensy.available()) SerialTeensy.read();
 
-  SerialTeensy.print("HELLO ");
-  SerialTeensy.print(OTA_TOKEN);
-  SerialTeensy.print("\n");
+  SerialTeensy.printf("HELLO %s\r\n", OTA_TOKEN);
   logOut += "Sent HELLO\n";
 
-  String resp = readLineFromTeensy(2000);
-  if (resp == "READY") {
-    logOut += "READY\n";
-  } else {
-    logOut += String("Unexpected HELLO reply: ") + (resp.length() ? resp : String("<timeout>")) + "\n";
+  String resp;
+  const uint8_t maxHelloAttempts = 2;
+  bool helloOk = false;
+  for (uint8_t attempt = 0; attempt < maxHelloAttempts; ++attempt) {
+    resp = readLineFromTeensy(2000);
+    if (resp == "READY") {
+      helloOk = true;
+      break;
+    }
+    if (resp == "BUSY") {
+      logOut += "Teensy reported BUSY, waiting...\n";
+      delay(250);
+      continue;
+    }
+    if (resp == "NACK") {
+      logOut += "HELLO rejected (token mismatch).\n";
+      break;
+    }
+    if (resp.length() == 0) {
+      logOut += "HELLO timeout, retrying...\n";
+      continue;
+    }
+    logOut += String("HELLO unexpected: ") + resp + "\n";
+    break;
+  }
+
+  if (!helloOk) {
     f.close();
     return false;
   }
+  logOut += "READY\n";
 
-  SerialTeensy.print("BEGIN HEX\n");
+  SerialTeensy.print("BEGIN HEX\r\n");
   resp = readLineFromTeensy(1000);
   if (resp.length()) {
     logOut += resp + "\n";
@@ -179,7 +199,7 @@ static bool flashTeensyFromFS(const char* path, String& logOut) {
 
     SerialTeensy.print("L ");
     SerialTeensy.print(rec);
-    SerialTeensy.print("\n");
+    SerialTeensy.print("\r\n");
     lineNumber++;
 
     String ack = readLineFromTeensy(600);
@@ -192,12 +212,12 @@ static bool flashTeensyFromFS(const char* path, String& logOut) {
       logOut += String("Timeout/Unexpected reply at line ") + lineNumber + ": " + (ack.length() ? ack : String("<timeout>")) + "\n";
     }
     f.close();
-    SerialTeensy.print("END\n");
+    SerialTeensy.print("END\r\n");
     return false;
   }
   f.close();
 
-  SerialTeensy.print("END\n");
+  SerialTeensy.print("END\r\n");
   logOut += String("Sent lines: ") + lineNumber + "\n";
 
   bool success = false;
