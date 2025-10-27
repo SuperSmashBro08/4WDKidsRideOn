@@ -247,6 +247,8 @@ static void handleSerial2Line(const char* line) {
 void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
+  pinMode(POT_PIN, INPUT);
+  analogReadResolution(12);
 
   Serial.begin(BAUD_USB);
   Serial2.begin(BAUD_UART);
