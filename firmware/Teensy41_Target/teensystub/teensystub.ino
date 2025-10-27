@@ -21,6 +21,7 @@ static constexpr uint32_t BAUD_USB  = 115200;   // Serial (USB) to PC
 static constexpr uint32_t BAUD_UART = 115200;   // Serial2 (pins 7/8) to ESP32
 static constexpr char     OTA_TOKEN[] = "8d81ab8762c545dabe699044766a0b72";
 static constexpr char     FW_VERSION[] = "fw-simple-ota-v2";
+static constexpr uint8_t POT_PIN = 27;
 
 static volatile bool handshake_ready = false;
 static volatile bool hex_in_progress = false;
