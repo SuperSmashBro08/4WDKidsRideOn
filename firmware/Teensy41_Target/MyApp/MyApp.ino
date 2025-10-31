@@ -3,7 +3,7 @@
 #include "OtaConsole.h"
 
 // Bump this each build so you can see updates in logs and in the ESP32 `VERSION` reply
-#define APP_FW_VERSION   "app-0.1.1"
+#define APP_FW_VERSION   "app-0.1.2"
 
 // Pick your test LED (Teensy 4.1 onboard LED is 13)
 #define LED_PIN          13
