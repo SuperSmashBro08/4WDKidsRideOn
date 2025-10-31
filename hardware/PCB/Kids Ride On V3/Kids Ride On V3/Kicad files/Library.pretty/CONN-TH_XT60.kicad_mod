@@ -1,0 +1,251 @@
+(footprint "CONN-TH_XT60"
+	(version 20241229)
+	(generator "pcbnew")
+	(generator_version "9.0")
+	(layer "F.Cu")
+	(property "Reference" "J3"
+		(at 0 5.2 0)
+		(layer "F.SilkS")
+		(uuid "f3513081-cd54-42d3-8abf-91a0a8fad091")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Value" "XT60-M."
+		(at 0 4 0)
+		(layer "F.Fab")
+		(uuid "ce7ddd2c-c97b-4f13-98b5-c808b38152cb")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Datasheet" "~"
+		(at 0 0 0)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "cd1436c4-12ee-449f-a124-85999872852f")
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "Description" "Generic connector, single row, 01x02, script generated (kicad-library-utils/schlib/autogen/connector/)"
+		(at 0 0 0)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "ff59d273-2732-4653-8189-46e786150cac")
+		(effects
+			(font
+				(size 1.27 1.27)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "LCSC" "C98733"
+		(at 0 0 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "3dbb2f7a-6922-4afe-860b-fbd4bfc8c9b1")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(property "MPN" "XT60-M."
+		(at 0 0 0)
+		(unlocked yes)
+		(layer "F.Fab")
+		(hide yes)
+		(uuid "5f636c4c-4443-4e31-9f44-b6fa70ab4941")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(attr through_hole)
+	(fp_line
+		(start -7.8 -4.1)
+		(end -7.8 4)
+		(stroke
+			(width 0.25)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "4ecb583c-b04a-44db-87bc-4dab9b066252")
+	)
+	(fp_line
+		(start -7.8 4)
+		(end -6 4)
+		(stroke
+			(width 0.25)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "711ebd0b-8a34-45bf-96d9-1ded6fc12f56")
+	)
+	(fp_line
+		(start -7.7 -2.5)
+		(end -7.7 2.5)
+		(stroke
+			(width 0.25)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "9091ac7a-a9c1-4485-8c2a-4246823c614d")
+	)
+	(fp_line
+		(start -7.7 2.5)
+		(end -6.2 4)
+		(stroke
+			(width 0.25)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "7e5362b5-84b9-4983-8ea2-621e2ee4661d")
+	)
+	(fp_line
+		(start -6.2 4)
+		(end 7.8 4)
+		(stroke
+			(width 0.25)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "d4fcd869-cc2f-47a9-9f51-966bb6be2f82")
+	)
+	(fp_line
+		(start -6.1 -4.1)
+		(end -7.8 -4.1)
+		(stroke
+			(width 0.25)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "b0ed850d-c8ac-47d7-805b-57bdb301b2f1")
+	)
+	(fp_line
+		(start -6.1 -4.1)
+		(end -7.7 -2.5)
+		(stroke
+			(width 0.25)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "cdb978b8-2c90-4b50-892f-b8a6bcaee50a")
+	)
+	(fp_line
+		(start -5.2 -4.1)
+		(end -6.1 -4.1)
+		(stroke
+			(width 0.25)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "efe46788-6a82-4224-a2be-65a3d0495a27")
+	)
+	(fp_line
+		(start 7.8 -4.1)
+		(end -5.3 -4.1)
+		(stroke
+			(width 0.25)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "f0bc2260-0ff9-4b3b-90a1-f8b111e93bdf")
+	)
+	(fp_line
+		(start 7.8 4)
+		(end 7.8 -4.1)
+		(stroke
+			(width 0.25)
+			(type solid)
+		)
+		(layer "F.SilkS")
+		(uuid "322995e6-e9b5-47c9-9868-77d414be4224")
+	)
+	(fp_circle
+		(center -7.75 4.05)
+		(end -7.72 4.05)
+		(stroke
+			(width 0.06)
+			(type solid)
+		)
+		(fill no)
+		(layer "F.Fab")
+		(uuid "1b0dad31-2a97-4384-b388-6649951dd33a")
+	)
+	(fp_circle
+		(center -3.6 0)
+		(end -2.72 0)
+		(stroke
+			(width 1.75)
+			(type solid)
+		)
+		(fill no)
+		(layer "F.Fab")
+		(uuid "3b81094d-9e65-49cd-b637-58ea48fc7bf5")
+	)
+	(fp_circle
+		(center 3.6 0)
+		(end 4.48 0)
+		(stroke
+			(width 1.75)
+			(type solid)
+		)
+		(fill no)
+		(layer "F.Fab")
+		(uuid "9a958775-43dd-4ce5-9578-74d90922b2df")
+	)
+	(fp_text user "${REFERENCE}"
+		(at 0 0 0)
+		(layer "F.Fab")
+		(uuid "6f790622-7673-453c-8549-f2f776053bcb")
+		(effects
+			(font
+				(size 1 1)
+				(thickness 0.15)
+			)
+		)
+	)
+	(pad "1" thru_hole circle
+		(at -3.6 0)
+		(size 5.8 5.8)
+		(drill 4.399991)
+		(layers "*.Cu" "*.Mask")
+		(remove_unused_layers no)
+		(uuid "f7020dc3-535e-4b8f-922a-cc3651bc7402")
+	)
+	(pad "2" thru_hole circle
+		(at 3.6 0)
+		(size 5.8 5.8)
+		(drill 4.399991)
+		(layers "*.Cu" "*.Mask")
+		(remove_unused_layers no)
+		(uuid "293f408e-3e03-49d9-87f6-32e311e2fa21")
+	)
+	(embedded_fonts no)
+	(model "${KIPRJMOD}/Library.pretty/CONN-TH_XT60.step"
+		(offset
+			(xyz 0 0 0)
+		)
+		(scale
+			(xyz 1 1 1)
+		)
+		(rotate
+			(xyz 0 0 0)
+		)
+	)
+)
