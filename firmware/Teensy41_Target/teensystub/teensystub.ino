@@ -10,10 +10,6 @@
 #include "intel_hex.h"
 #include "update_flag.h"
 
-#ifdef ARDUINO_TEENSY41
-#include "imxrt.h"
-#endif
-
 using namespace ota;
 
 namespace

@@ -1,16 +1,9 @@
 #include "jump_to_app.h"
 
 #include "flash_map.h"
+#include "hw_defs.h"
 
 #include <cstdint>
-
-#ifdef ARDUINO_TEENSY41
-#include "Arduino.h"
-#endif
-#if defined(ARDUINO_TEENSY41) || defined(__IMXRT1062__)
-#include "imxrt.h"
-#include "core_cm7.h"
-#endif
 
 extern "C" void __set_MSP(std::uint32_t topOfMainStack);
 
@@ -23,8 +16,10 @@ namespace ota
 
     __disable_irq();
     __set_MSP(stack_pointer);
-#if defined(ARDUINO_TEENSY41) || defined(__IMXRT1062__)
+#if OTA_HAS_NATIVE_IMXRT
     SCB->VTOR = app_base_address;
+#elif OTA_TARGET_IMXRT
+    ota::hw::set_vtor(app_base_address);
 #endif
     __DSB();
     __ISB();

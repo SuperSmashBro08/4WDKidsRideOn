@@ -2,15 +2,9 @@
 
 #include "crc32.h"
 #include "flash_lowlevel.h"
+#include "hw_defs.h"
 
 #include <cstring>
-
-#ifdef ARDUINO_TEENSY41
-#include "Arduino.h"
-#endif
-#if defined(ARDUINO_TEENSY41) || defined(__IMXRT1062__)
-#include "imxrt.h"
-#endif
 
 namespace ota
 {
@@ -24,11 +18,16 @@ struct FlagLayout
 
 constexpr std::uint32_t RTC_MAGIC = 0x55465041u; // 'UFPA'
 
-#if defined(ARDUINO_TEENSY41) || defined(__IMXRT1062__)
+#if OTA_HAS_NATIVE_IMXRT
 constexpr std::uint32_t SNVS_LPGPR_BASE = 0x400A4010u;
 volatile std::uint32_t &rtc_word(std::size_t index)
 {
     return *reinterpret_cast<volatile std::uint32_t *>(SNVS_LPGPR_BASE + index * sizeof(std::uint32_t));
+}
+#elif OTA_TARGET_IMXRT
+volatile std::uint32_t &rtc_word(std::size_t index)
+{
+    return ota::hw::snvs_gpr(index);
 }
 #else
 static std::uint32_t rtc_storage[4] = {0};

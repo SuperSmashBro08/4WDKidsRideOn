@@ -2,18 +2,12 @@
 
 #include "crc32.h"
 #include "flash_map.h"
+#include "hw_defs.h"
 
 #include <algorithm>
 #include <cstring>
 
-#ifdef ARDUINO_TEENSY41
-#include "Arduino.h"
-#endif
-#if defined(ARDUINO_TEENSY41) || defined(__IMXRT1062__)
-#include "imxrt.h"
-#endif
-
-#if defined(ARDUINO_TEENSY41) || defined(__IMXRT1062__)
+#if OTA_TARGET_IMXRT
 extern "C" void arm_dcache_flush_delete(void *addr, unsigned size);
 extern "C" void arm_dcache_delete(void *addr, unsigned size);
 extern "C" void arm_icache_flush(void);
@@ -21,7 +15,7 @@ extern "C" void arm_icache_flush(void);
 
 namespace ota
 {
-#if defined(ARDUINO_TEENSY41) || defined(__IMXRT1062__)
+#if OTA_TARGET_IMXRT
 namespace
 {
 constexpr std::uint32_t SEQID_ERASE_SECTOR = 5; // mapped in custom LUT
@@ -33,6 +27,7 @@ std::uint32_t to_ip_address(std::uint32_t absolute)
     return absolute - QSPI_FLASH_BASE;
 }
 
+#if OTA_HAS_NATIVE_IMXRT
 void flexspi_wait_arbitration_idle()
 {
     while (!(FLEXSPI2->STS0 & FLEXSPI_STS0_ARBIDLE))
@@ -112,6 +107,89 @@ void flexspi_program(std::uint32_t absolute, const void *data, std::size_t lengt
     }
     flexspi_wait_sequence_idle();
 }
+#else
+using namespace ota::hw;
+
+void flexspi_wait_arbitration_idle()
+{
+    while (!(sts0() & FLEXSPI_STS0_ARBIDLE))
+    {
+    }
+}
+
+void flexspi_wait_sequence_idle()
+{
+    while (!(sts0() & FLEXSPI_STS0_SEQIDLE))
+    {
+    }
+}
+
+void flexspi_wait_ipcmd_done()
+{
+    while (!(intr() & FLEXSPI_INTR_IPCMDDONE))
+    {
+    }
+    intr() = FLEXSPI_INTR_IPCMDDONE;
+}
+
+void flexspi_clear_fifos()
+{
+    iptxfcr() = FLEXSPI_IPTXFCR_CLRIPTXF;
+    iprxfcr() = FLEXSPI_IPRXFCR_CLRIPRXF;
+}
+
+void flexspi_issue_command(std::uint32_t seq_id, std::uint32_t absolute)
+{
+    flexspi_wait_arbitration_idle();
+    flexspi_clear_fifos();
+    ipcr0() = to_ip_address(absolute);
+    ipcr1() = FLEXSPI_IPCR1_ISEQID(seq_id) | FLEXSPI_IPCR1_ISEQNUM(0);
+    ipcmd() = FLEXSPI_IPCMD_TRG;
+    flexspi_wait_ipcmd_done();
+    flexspi_wait_sequence_idle();
+}
+
+void flexspi_program(std::uint32_t absolute, const void *data, std::size_t length)
+{
+    const std::uint8_t *src = static_cast<const std::uint8_t *>(data);
+    std::size_t total_words = (length + 3u) / 4u;
+    std::size_t consumed = 0;
+
+    flexspi_wait_arbitration_idle();
+    flexspi_clear_fifos();
+    ipcr0() = to_ip_address(absolute);
+    ipcr1() = FLEXSPI_IPCR1_ISEQID(SEQID_PAGE_PROGRAM) |
+              FLEXSPI_IPCR1_ISEQNUM(0);
+
+    volatile std::uint32_t *fifo = tfdr();
+    while (consumed < total_words)
+    {
+        std::size_t batch = std::min<std::size_t>(FLEXSPI_TXFIFO_WORDS, total_words - consumed);
+        for (std::size_t i = 0; i < batch; ++i)
+        {
+            std::uint32_t word = 0xFFFFFFFFu;
+            std::size_t byte_index = (consumed + i) * 4u;
+            std::size_t remain = (byte_index < length) ? (length - byte_index) : 0;
+            if (remain > 0)
+            {
+                std::memcpy(&word, src + byte_index, std::min<std::size_t>(4, remain));
+            }
+            fifo[i] = word;
+        }
+        consumed += batch;
+        ipcmd() = FLEXSPI_IPCMD_TRG;
+        flexspi_wait_ipcmd_done();
+        if (consumed < total_words)
+        {
+            flexspi_clear_fifos();
+            ipcr0() = to_ip_address(absolute) + consumed * 4u;
+            ipcr1() = FLEXSPI_IPCR1_ISEQID(SEQID_PAGE_PROGRAM) |
+                      FLEXSPI_IPCR1_ISEQNUM(0);
+        }
+    }
+    flexspi_wait_sequence_idle();
+}
+#endif
 } // namespace
 
 void flash_read(std::uint32_t address, void *buffer, std::size_t length)
