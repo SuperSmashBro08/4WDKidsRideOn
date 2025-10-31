@@ -1,11 +1,11 @@
 /*
- * ESP32-S3 → Teensy 4.1 OTA uploader (robust)
- * -------------------------------------------
+ * ESP32-S3 → Teensy 4.1 OTA uploader + Live Console
+ * -------------------------------------------------
  * - Wiring: ESP32 GPIO43 (TX) -> Teensy RX2 pin 7
  *           ESP32 GPIO44 (RX) <- Teensy TX2 pin 8
  *           GND ↔ GND
  * - Browse to http://<esp32-ip>/ to upload the Teensy-exported Intel HEX (.hex).
- * - Speaks HELLO / BEGIN HEX / L <line> / END; verifies OK <n>; checks EOF.
+ * - Live console at /console shows Teensy lines starting with "S " (from OtaConsole).
  */
 
 #include <WiFi.h>
@@ -25,6 +25,17 @@ static String lastOtaLog;
 static bool   lastOtaSuccess = false;
 static unsigned long lastOtaMillis = 0;
 
+// ---------- Live console ring buffer (only lines prefixed with "S ") ----------
+static const uint16_t CON_CAP = 500;        // ~500 recent lines
+static String         conBuf[CON_CAP];
+static uint32_t       conId    = 0;         // monotonically increasing line id
+static String         conLine;              // UART line assembler
+
+static inline void conStore(const String& s) {
+  conBuf[conId % CON_CAP] = s;
+  conId++;
+}
+
 // ---------- Small helpers ----------
 static String htmlEscape(const String& in) {
   String out; out.reserve(in.length() + 16);
@@ -40,7 +51,7 @@ static String htmlEscape(const String& in) {
 
 static String buildIndexPage() {
   String page;
-  page.reserve(2400);
+  page.reserve(2800);
   page += F(
   "<!doctype html><html><head><meta charset='utf-8'>"
   "<meta name=viewport content='width=device-width,initial-scale=1'>"
@@ -55,12 +66,14 @@ static String buildIndexPage() {
     "button{padding:8px 14px;border:0;border-radius:8px;background:#111;color:#fff;cursor:pointer}"
     "button[disabled]{opacity:.6;cursor:not-allowed}"
     "#status{min-height:1.2em}"
+    "a.btn{display:inline-block;padding:8px 12px;border-radius:8px;background:#0b5; color:#fff; text-decoration:none}"
   "</style>"
   "</head><body><h2>ESP32 → Teensy OTA</h2>"
   "<form id='f' method='POST' action='/upload' enctype='multipart/form-data'>"
   "<p><b>Upload Teensy firmware</b> (<code>.hex</code> from <i>Export compiled Binary</i>)</p>"
   "<input id='file' type='file' name='firmware' accept='.hex' required>"
-  "<p><button id='go' type='submit'>Upload & Flash</button></p>"
+  "<p><button id='go' type='submit'>Upload & Flash</button> "
+  "<a class='btn' href='/console'>Open Live Console</a></p>"
   "<div id='bar'><div id='fill' class='info'></div></div>"
   "<div id='status'></div>"
   "</form>"
@@ -71,7 +84,6 @@ static String buildIndexPage() {
   "</p>"
   );
 
-  // Last result (uses your existing globals)
   if (lastOtaLog.length()) {
     page += lastOtaSuccess ? F("<h3 style='color:#0a0'>Last OTA: success</h3>")
                            : F("<h3 style='color:#b00'>Last OTA: failed</h3>");
@@ -175,7 +187,7 @@ static bool readLineFrom(Stream& s, String& out, uint32_t to_ms=3000) {
   out = ""; unsigned long t0 = millis();
   while (millis()-t0 < to_ms) {
     while (s.available()) {
-      char c = (char)s.read();
+      char c = (char)SerialTeensy.read(); // use SerialTeensy to ensure HW serial
       if (c=='\r') continue;
       if (c=='\n') { out.trim(); return true; }
       if (out.length() < 240) out += c;
@@ -214,6 +226,24 @@ static bool validateHexFile(File& f, String& err) {
   f.seek(0);
   if (lastNonEmpty != ":00000001FF") { err = "missing EOF (:00000001FF)"; return false; }
   return true;
+}
+
+// Pump Teensy UART into ring buffer; keep only app lines that start with "S "
+static void pumpTeensyConsole() {
+  while (SerialTeensy.available()) {
+    char c = (char)SerialTeensy.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      conLine.trim();
+      if (conLine.length() >= 2 && conLine[0] == 'S' && conLine[1] == ' ') {
+        // Drop the "S " prefix before storing
+        conStore(conLine.substring(2));
+      }
+      conLine = "";
+    } else {
+      if (conLine.length() < 512) conLine += c;
+    }
+  }
 }
 
 // Talk to Teensy & flash from a .hex stored on LittleFS
@@ -280,7 +310,6 @@ static bool flashTeensyFromFS(const char* path, String& logOut) {
     logOut += "<- " + ack + "\n";
 
     if (ack.startsWith("OK ")) {
-      // (optional) verify line number matches Teensy reply
       uint32_t n = ack.substring(3).toInt();
       if (n != lineNumber) logOut += "WARN: OK index mismatch (got " + String(n) + ")\n";
       ok++;
@@ -321,7 +350,6 @@ static bool flashTeensyFromFS(const char* path, String& logOut) {
 static void handleRoot() { server.send(200, "text/html", buildIndexPage()); }
 
 static void handlePing() {
-  // simple sanity ping
   while (SerialTeensy.available()) SerialTeensy.read();
   SerialTeensy.print("PING\r\n");
   String resp;
@@ -338,9 +366,106 @@ static void handleVersion() {
   server.send(out.length()?200:504, "text/plain", out.length()?out:"timeout");
 }
 
-// NEW: return OK/ERR for the last OTA result (used by the web UI to finalize)
+// Return OK/ERR for the last OTA result (used by the web UI to finalize)
 static void handleLast() {
   server.send(200, "text/plain", lastOtaSuccess ? "OK" : "ERR");
+}
+
+// Live console page (newest-first at the top)
+static void handleConsolePage() {
+  String page;
+  page.reserve(2600);
+  page += F(
+    "<!doctype html><html><head><meta charset='utf-8'>"
+    "<meta name=viewport content='width=device-width,initial-scale=1'>"
+    "<title>Teensy Console</title>"
+    "<style>"
+    "body{font-family:system-ui;margin:12px}"
+    "#log{background:#0b1220;color:#d7e0f2;padding:12px;border-radius:8px;min-height:70vh;"
+    "font:13px ui-monospace,Consolas,monospace;overflow:auto}"
+    ".line{white-space:pre-wrap;margin:0}"
+    "a{color:#6cf;text-decoration:none}"
+    "</style>"
+    "</head><body>"
+    "<h3>Teensy Console (newest on top)</h3>"
+    "<p><a href='/'>⬅ Back</a></p>"
+    "<div id='log'></div>"
+    "<script>"
+    "let since=0;"
+    "const log=document.getElementById('log');"
+    "const MAX_NODES=1200;  // cap DOM nodes to stay fast"
+    "function prependLines(text){"
+      "if(!text) return;"
+      "const lines=text.split('\\n');"
+      "for(let i=0;i<lines.length;i++){"
+        "const L=lines[i];"
+        "if(!L) continue;"
+        "const div=document.createElement('div');"
+        "div.className='line';"
+        "div.textContent=L;"
+        "log.insertBefore(div, log.firstChild);"  // NEWEST FIRST
+      "}"
+      "// trim extra nodes"
+      "while(log.childNodes.length>MAX_NODES){"
+        "log.removeChild(log.lastChild);"
+      "}"
+    "}"
+    "function pull(){"
+      "fetch('/tail?since='+since,{cache:'no-store'})"
+      ".then(r=>r.text()).then(t=>{"
+        "const nl=t.indexOf('\\n');"
+        "if(nl>0){"
+          "const hdr=t.substring(0,nl);"
+          "if(hdr.startsWith('NEXT ')){ since=parseInt(hdr.substring(5))||since; }"
+          "const body=t.substring(nl+1);"
+          "// server returns oldest→newest; to prepend with newest on top,"
+          "// we reverse the order so the newest ends up nearest the top."
+          "const lines=body.split('\\n').filter(x=>x.length);"
+          "for(let i=lines.length-1;i>=0;i--){"
+            "prependLines(lines[i]+'\\n');"
+          "}"
+        "}"
+      "}).catch(()=>{});"
+    "}"
+    "setInterval(pull, 300);"
+    "</script>"
+    "</body></html>"
+  );
+  server.send(200, "text/html", page);
+}
+
+
+// Tail endpoint polled by the console
+static void handleTail() {
+  uint32_t since = 0;
+  if (server.hasArg("since")) {
+    since = (uint32_t) strtoul(server.arg("since").c_str(), nullptr, 10);
+  }
+
+  const uint16_t MAX_LINES = 200;
+  uint32_t curId = conId;
+  uint32_t start = since + 1;
+  if (start + MAX_LINES < curId) start = curId - MAX_LINES;
+
+  String out;
+  out.reserve(4096);
+  out += "NEXT ";
+  out += String(curId);
+  out += "\n";
+
+  for (uint32_t id = start; id <= curId; ++id) {
+    if (id == 0) continue;
+    if (id > conId) break;
+    if ((curId - id) >= CON_CAP) continue; // fell out of ring
+    const String& line = conBuf[id % CON_CAP];
+    if (line.length()) {
+      out += line;
+      out += "\n";
+      if (out.length() > 60000) break; // safety
+    }
+  }
+
+  server.send(200, "text/plain", out);
 }
 
 static File uploadFile;
@@ -380,7 +505,7 @@ static void handleUpload() {
 
     Serial.println("[OTA RESULT]\n" + log);
 
-    // We can return a tiny payload — the JS will check /last anyway.
+    // Minimal response; UI will check /last to avoid false "network error".
     server.send(ok ? 200 : 500, "text/plain", ok ? "OK\n" : "ERR\n");
   }
 }
@@ -389,7 +514,7 @@ static void handleUpload() {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n== ESP32 → Teensy OTA ==");
+  Serial.println("\n== ESP32 → Teensy OTA + Console ==");
 
   ensureLittleFS();
   connectWifi();
@@ -399,17 +524,23 @@ void setup() {
   SerialTeensy.begin(115200, SERIAL_8N1, TEENSY_RX, TEENSY_TX);
   Serial.printf("[UART] SerialTeensy on RX=%d TX=%d @115200\n", TEENSY_RX, TEENSY_TX);
 
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/upload", HTTP_POST, [](){}, handleUpload);
-  server.on("/ping", HTTP_GET, handlePing);
-  server.on("/version", HTTP_GET, handleVersion);
-  server.on("/last", HTTP_GET, handleLast);   // <— new
+  server.on("/",        HTTP_GET,  handleRoot);
+  server.on("/upload",  HTTP_POST, [](){}, handleUpload);
+  server.on("/ping",    HTTP_GET,  handlePing);
+  server.on("/version", HTTP_GET,  handleVersion);
+  server.on("/last",    HTTP_GET,  handleLast);
+  server.on("/console", HTTP_GET,  handleConsolePage);
+  server.on("/tail",    HTTP_GET,  handleTail);
   server.begin();
   Serial.println("[HTTP] Server ready.");
 }
 
 void loop() {
+  // Pull Teensy UART into the console buffer continuously
+  pumpTeensyConsole();
+
   server.handleClient();
+
   static unsigned long lastCheck = 0;
   if (millis()-lastCheck > 3000) {
     lastCheck = millis();
