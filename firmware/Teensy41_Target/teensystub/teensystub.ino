@@ -1,6 +1,7 @@
 #include <Arduino.h>
 #include <algorithm>
 #include <cstring>
+#include <string>
 #include <string_view>
 
 #include "crc32.h"
@@ -17,6 +18,8 @@ using namespace ota;
 
 namespace
 {
+bool process_record(const HexRecord &record, std::string &error_message);
+
 class StagingWriter
 {
 public:
@@ -27,7 +30,7 @@ public:
         page_dirty_ = false;
     }
 
-    void write(std::uint32_t address, const std::uint8_t *data, std::size_t length)
+    bool write(std::uint32_t address, const std::uint8_t *data, std::size_t length, std::string &error_message)
     {
         while (length > 0)
         {
@@ -39,7 +42,8 @@ public:
                 std::memset(page_buffer_, 0xFF, sizeof(page_buffer_));
             }
 
-            ensure_sector_erased(page_base);
+            if (!ensure_sector_erased(page_base, error_message))
+                return false;
 
             std::size_t offset = address - page_base;
             std::size_t chunk = std::min<std::size_t>(FLASH_PAGE_SIZE - offset, length);
@@ -50,6 +54,7 @@ public:
             length -= chunk;
             page_dirty_ = true;
         }
+        return true;
     }
 
     void finalize()
@@ -58,16 +63,20 @@ public:
     }
 
 private:
-    void ensure_sector_erased(std::uint32_t address)
+    bool ensure_sector_erased(std::uint32_t address, std::string &error_message)
     {
         std::uint32_t index = (address - FLASH_BASE_STAGING) / FLASH_SECTOR_SIZE;
         if (index >= MAX_STAGING_SECTORS)
-            throw IntelHexError("Staging overflow");
+        {
+            error_message = "Staging overflow";
+            return false;
+        }
         if (!sector_erased_[index])
         {
             flash_erase_sector(FLASH_BASE_STAGING + index * FLASH_SECTOR_SIZE);
             sector_erased_[index] = true;
         }
+        return true;
     }
 
     void flush()
@@ -95,12 +104,15 @@ bool eof_received = false;
 bool update_active = false;
 bool base_is_absolute = false;
 
-void process_record(const HexRecord &record)
+bool process_record(const HexRecord &record, std::string &error_message)
 {
     if (record.type == 0x00 && record.length > 0)
     {
         if (!update_active)
-            throw IntelHexError("Data outside of update session");
+        {
+            error_message = "Data outside of update session";
+            return false;
+        }
         if (image_base == 0xFFFFFFFFu)
         {
             if (record.address >= FLASH_BASE_ACTIVE &&
@@ -118,18 +130,24 @@ void process_record(const HexRecord &record)
 
         if (!base_is_absolute && record.address < image_base)
         {
-            throw IntelHexError("Non-monotonic address");
+            error_message = "Non-monotonic address";
+            return false;
         }
         if (base_is_absolute && record.address < FLASH_BASE_ACTIVE)
         {
-            throw IntelHexError("Address below active region");
+            error_message = "Address below active region";
+            return false;
         }
 
         std::uint32_t relative = base_is_absolute ? (record.address - FLASH_BASE_ACTIVE)
                                                   : (record.address - image_base);
         if (relative + record.length > FLASH_SIZE_STAGING)
-            throw IntelHexError("Image too large for staging");
-        staging_writer.write(FLASH_BASE_STAGING + relative, record.data, record.length);
+        {
+            error_message = "Image too large for staging";
+            return false;
+        }
+        if (!staging_writer.write(FLASH_BASE_STAGING + relative, record.data, record.length, error_message))
+            return false;
         running_crc = crc32_update(running_crc, record.data, record.length);
         image_size = std::max(image_size, relative + static_cast<std::uint32_t>(record.length));
     }
@@ -137,6 +155,7 @@ void process_record(const HexRecord &record)
     {
         eof_received = true;
     }
+    return true;
 }
 
 void reset_state()
@@ -158,7 +177,6 @@ void start_update()
 {
     reset_state();
     update_active = true;
-    staging_writer.begin();
 }
 
 void finalize_update()
@@ -202,14 +220,11 @@ void process_line(const String &line)
         return;
     if (line.length() > 0 && line[0] == ':')
     {
-        try
-        {
-            parser->feed_line(std::string_view(line.c_str(), line.length()));
-        }
-        catch (const IntelHexError &err)
+        std::string error;
+        if (!parser->feed_line(std::string_view(line.c_str(), line.length()), &error))
         {
             Serial2.print("ERR ");
-            Serial2.println(err.what());
+            Serial2.println(error.c_str());
             reset_state();
         }
         return;
@@ -243,7 +258,7 @@ void loop()
         if (c == '\n')
         {
             process_line(line_buffer);
-            line_buffer.clear();
+            line_buffer = "";
         }
         else
         {

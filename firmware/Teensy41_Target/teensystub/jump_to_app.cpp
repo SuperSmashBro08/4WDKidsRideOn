@@ -5,7 +5,11 @@
 #include <cstdint>
 
 #ifdef ARDUINO_TEENSY41
+#include "Arduino.h"
+#endif
+#if defined(ARDUINO_TEENSY41) || defined(__IMXRT1062__)
 #include "imxrt.h"
+#include "core_cm7.h"
 #endif
 
 extern "C" void __set_MSP(std::uint32_t topOfMainStack);
@@ -19,7 +23,7 @@ namespace ota
 
     __disable_irq();
     __set_MSP(stack_pointer);
-#ifdef ARDUINO_TEENSY41
+#if defined(ARDUINO_TEENSY41) || defined(__IMXRT1062__)
     SCB->VTOR = app_base_address;
 #endif
     __DSB();

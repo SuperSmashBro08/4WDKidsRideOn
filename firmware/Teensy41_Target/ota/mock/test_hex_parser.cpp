@@ -6,6 +6,7 @@
 
 #include <cassert>
 #include <iostream>
+#include <string>
 #include <vector>
 
 using namespace ota;
@@ -17,16 +18,20 @@ int main()
     std::vector<std::uint8_t> captured;
     std::uint32_t last_address = 0;
 
-    IntelHexParser parser([&](const HexRecord &record) {
+    IntelHexParser parser([&](const HexRecord &record, std::string &error) {
         if (record.type == 0x00)
         {
             captured.assign(record.data, record.data + record.length);
             last_address = record.address;
         }
+        return true;
     });
 
-    parser.feed_line(":10000000000102030405060708090A0B0C0D0E0F78");
-    parser.feed_line(":00000001FF");
+    std::string error;
+    bool ok = parser.feed_line(":10000000000102030405060708090A0B0C0D0E0F78", &error);
+    assert(ok && error.empty());
+    ok = parser.feed_line(":00000001FF", &error);
+    assert(ok && error.empty());
 
     assert(captured.size() == 16);
     assert(captured.front() == 0x00);
@@ -34,14 +39,17 @@ int main()
     assert(last_address == 0x00000000);
     assert(parser.max_address() == 0x10);
 
-    IntelHexParser parser_ela([&](const HexRecord &record) {
+    IntelHexParser parser_ela([&](const HexRecord &record, std::string &error) {
         if (record.type == 0x00)
         {
             last_address = record.address;
         }
+        return true;
     });
-    parser_ela.feed_line(":020000040003F7");
-    parser_ela.feed_line(":10001000101112131415161718191A1B1C1D1E1F68");
+    ok = parser_ela.feed_line(":020000040003F7", &error);
+    assert(ok);
+    ok = parser_ela.feed_line(":10001000101112131415161718191A1B1C1D1E1F68", &error);
+    assert(ok);
     assert(last_address == 0x00030010);
 
     const char *crc_sample = "123456789";

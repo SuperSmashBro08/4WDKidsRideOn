@@ -7,8 +7,13 @@
 #include <cstring>
 
 #ifdef ARDUINO_TEENSY41
+#include "Arduino.h"
+#endif
+#if defined(ARDUINO_TEENSY41) || defined(__IMXRT1062__)
 #include "imxrt.h"
+#endif
 
+#if defined(ARDUINO_TEENSY41) || defined(__IMXRT1062__)
 extern "C" void arm_dcache_flush_delete(void *addr, unsigned size);
 extern "C" void arm_dcache_delete(void *addr, unsigned size);
 extern "C" void arm_icache_flush(void);
@@ -16,7 +21,7 @@ extern "C" void arm_icache_flush(void);
 
 namespace ota
 {
-#ifdef ARDUINO_TEENSY41
+#if defined(ARDUINO_TEENSY41) || defined(__IMXRT1062__)
 namespace
 {
 constexpr std::uint32_t SEQID_ERASE_SECTOR = 5; // mapped in custom LUT
@@ -30,7 +35,7 @@ std::uint32_t to_ip_address(std::uint32_t absolute)
 
 void flexspi_wait_arbitration_idle()
 {
-    while (FLEXSPI2->STS0 & FLEXSPI_STS0_ARBUSY)
+    while (!(FLEXSPI2->STS0 & FLEXSPI_STS0_ARBIDLE))
     {
     }
 }
@@ -61,7 +66,7 @@ void flexspi_issue_command(std::uint32_t seq_id, std::uint32_t absolute)
     flexspi_wait_arbitration_idle();
     flexspi_clear_fifos();
     FLEXSPI2->IPCR0 = to_ip_address(absolute);
-    FLEXSPI2->IPCR1 = FLEXSPI_IPCR1_SEQID(seq_id) | FLEXSPI_IPCR1_SEQNUM(0);
+    FLEXSPI2->IPCR1 = FLEXSPI_IPCR1_ISEQID(seq_id) | FLEXSPI_IPCR1_ISEQNUM(0);
     FLEXSPI2->IPCMD = FLEXSPI_IPCMD_TRG;
     flexspi_wait_ipcmd_done();
     flexspi_wait_sequence_idle();
@@ -76,7 +81,8 @@ void flexspi_program(std::uint32_t absolute, const void *data, std::size_t lengt
     flexspi_wait_arbitration_idle();
     flexspi_clear_fifos();
     FLEXSPI2->IPCR0 = to_ip_address(absolute);
-    FLEXSPI2->IPCR1 = FLEXSPI_IPCR1_SEQID(SEQID_PAGE_PROGRAM) | FLEXSPI_IPCR1_SEQNUM(0);
+    FLEXSPI2->IPCR1 = FLEXSPI_IPCR1_ISEQID(SEQID_PAGE_PROGRAM) |
+                       FLEXSPI_IPCR1_ISEQNUM(0);
 
     volatile std::uint32_t *fifo = &FLEXSPI2->TFDR[0];
     while (consumed < total_words)
@@ -100,6 +106,8 @@ void flexspi_program(std::uint32_t absolute, const void *data, std::size_t lengt
         {
             flexspi_clear_fifos();
             FLEXSPI2->IPCR0 = to_ip_address(absolute) + consumed * 4u;
+            FLEXSPI2->IPCR1 = FLEXSPI_IPCR1_ISEQID(SEQID_PAGE_PROGRAM) |
+                               FLEXSPI_IPCR1_ISEQNUM(0);
         }
     }
     flexspi_wait_sequence_idle();

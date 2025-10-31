@@ -3,7 +3,6 @@
 #include <cstdint>
 #include <cstddef>
 #include <functional>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -17,20 +16,14 @@ struct HexRecord
     const std::uint8_t *data;
 };
 
-class IntelHexError : public std::runtime_error
-{
-public:
-    explicit IntelHexError(const std::string &msg) : std::runtime_error(msg) {}
-};
-
 class IntelHexParser
 {
 public:
-    using RecordCallback = std::function<void(const HexRecord &)>;
+    using RecordCallback = std::function<bool(const HexRecord &, std::string &)>;
 
     explicit IntelHexParser(RecordCallback cb);
 
-    void feed_line(std::string_view line);
+    bool feed_line(std::string_view line, std::string *error_message = nullptr);
     void reset();
 
     std::uint32_t max_address() const noexcept { return max_address_; }

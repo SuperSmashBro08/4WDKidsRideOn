@@ -6,6 +6,9 @@
 #include <cstring>
 
 #ifdef ARDUINO_TEENSY41
+#include "Arduino.h"
+#endif
+#if defined(ARDUINO_TEENSY41) || defined(__IMXRT1062__)
 #include "imxrt.h"
 #endif
 
@@ -21,10 +24,11 @@ struct FlagLayout
 
 constexpr std::uint32_t RTC_MAGIC = 0x55465041u; // 'UFPA'
 
-#ifdef ARDUINO_TEENSY41
+#if defined(ARDUINO_TEENSY41) || defined(__IMXRT1062__)
+constexpr std::uint32_t SNVS_LPGPR_BASE = 0x400A4010u;
 volatile std::uint32_t &rtc_word(std::size_t index)
 {
-    return SNVS_LP->GPR[index];
+    return *reinterpret_cast<volatile std::uint32_t *>(SNVS_LPGPR_BASE + index * sizeof(std::uint32_t));
 }
 #else
 static std::uint32_t rtc_storage[4] = {0};
