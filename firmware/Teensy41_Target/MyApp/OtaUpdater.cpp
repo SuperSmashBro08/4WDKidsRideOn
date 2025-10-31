@@ -1,6 +1,9 @@
 #include "OtaUpdater.h"
 #include "FXUtil.h"
-extern "C" { #include "FlashTxx.h" }
+
+extern "C" {
+  #include "FlashTxx.h"
+}
 
 static HardwareSerial* _ota = &Serial2;
 static uint32_t        _baud = 115200;
@@ -10,6 +13,12 @@ static constexpr char  OTA_TOKEN[] = "8d81ab8762c545dabe699044766a0b72";
 
 // What we return to VERSION (human-readable)
 static const char*     LOADER_ID = "FlasherX v2.4 (in-app)";
+
+// === App-provided version/name (set from your .ino via setAppVersion) ===
+static const char* _appVersion = "MyApp";
+void OtaUpdater::setAppVersion(const char* name) {
+  _appVersion = (name && name[0]) ? name : "MyApp";
+}
 
 struct OtaSession {
   bool handshakeReady;
@@ -102,10 +111,14 @@ static void handleLine(const char* line) {
   if (!strcmp(line, "END"))       { endHex();   return; }
   if (!strcmp(line, "PING"))      { sendLine("PONG"); return; }
 
-  // VERSION: keep compatible with your ESP32 UI
+  // VERSION: now reports the string set from your .ino
   if (!strcmp(line, "VERSION")) {
-    _ota->print("FW MyApp\r\n");
-    _ota->print("FLASHERX "); _ota->print(LOADER_ID); _ota->print("\r\n");
+    _ota->print("FW ");
+    _ota->print(_appVersion);
+    _ota->print("\r\n");
+    _ota->print("FLASHERX ");
+    _ota->print(LOADER_ID);
+    _ota->print("\r\n");
     return;
   }
 

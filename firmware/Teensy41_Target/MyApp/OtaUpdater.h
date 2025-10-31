@@ -15,6 +15,7 @@
  *     Serial.begin(115200);
  *     Serial2.begin(115200);            // Teensy RX2/TX2 on pins 7/8
  *     OtaUpdater::begin(Serial2);       // arm OTA
+ *     OtaUpdater::setAppVersion(APP_FW_VERSION); // <-- set your app version/name
  *     OtaConsole::begin(Serial2);       // optional logs to ESP32
  *   }
  *
@@ -31,6 +32,10 @@ namespace OtaUpdater {
   // Initialize OTA on the given UART (usually Serial2). Baud defaults to 115200.
   void begin(HardwareSerial& otaPort, uint32_t baud = 115200);
 
+  // Provide a human-readable app identifier/version for VERSION replies.
+  // Example: OtaUpdater::setAppVersion("RideOnDyno v0.9.1");
+  void setAppVersion(const char* name);
+
   // Call this frequently from loop(); it parses incoming lines and performs OTA.
   void tick();
 
@@ -40,3 +45,4 @@ namespace OtaUpdater {
   // Optional: string to identify the embedded loader (for VERSION requests).
   const char* loaderId();   // returns e.g. "FlasherX v2.4 (in-app)"
 }
+

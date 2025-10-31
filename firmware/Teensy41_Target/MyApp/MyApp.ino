@@ -2,8 +2,8 @@
 #include "OtaUpdater.h"
 #include "OtaConsole.h"
 
-// Bump this each build so you can see updates in logs
-#define APP_FW_VERSION   "app-0.1.0"
+// Bump this each build so you can see updates in logs and in the ESP32 `VERSION` reply
+#define APP_FW_VERSION   "app-0.1.1"
 
 // Pick your test LED (Teensy 4.1 onboard LED is 13)
 #define LED_PIN          13
@@ -22,6 +22,9 @@ void setup() {
   // Keep OTA forever
   OtaUpdater::begin(Serial2);
 
+  // Tell the in-app OTA loader what to report for "FW ..."
+  OtaUpdater::setAppVersion(APP_FW_VERSION);
+
   // Optional logging to ESP32 (prefix "S " so it never conflicts with OTA)
   OtaConsole::begin(Serial2);
 
@@ -39,7 +42,8 @@ void loop() {
   static uint32_t t_led = 0;
   static bool led_on = false;
 
-  if (!OtaUpdater::inProgress()) { // avoid blinking during flash, purely cosmetic
+  // Avoid blinking during flash (purely cosmetic)
+  if (!OtaUpdater::inProgress()) {
     if (millis() - t_led >= BLINK_MS) {
       t_led = millis();
       led_on = !led_on;
