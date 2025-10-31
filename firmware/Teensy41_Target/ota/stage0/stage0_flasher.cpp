@@ -1,8 +1,8 @@
-#include "crc32.h"
-#include "flash_lowlevel.h"
-#include "flash_map.h"
-#include "jump_to_app.h"
-#include "update_flag.h"
+#include "../teensystub/crc32.h"
+#include "../teensystub/flash_lowlevel.h"
+#include "../teensystub/flash_map.h"
+#include "../teensystub/jump_to_app.h"
+#include "../teensystub/update_flag.h"
 
 #include <algorithm>
 #include <cstdint>

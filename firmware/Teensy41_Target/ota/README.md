@@ -40,8 +40,8 @@ On success the runtime stores the CRC32 and payload size, raises the update flag
 
 * `stage0/stage0_flasher.cpp` – ITCM/DTCM resident swapper that copies from staging into the active slot and then jumps to the application.
 * `stage0/stage0_flasher.ld` – Linker script placing code in ITCM/DTCM while keeping load addresses inside the reserved flash window.
-* `stage1/stage1_runtime.ino` – Arduino sketch handling Serial2, Intel-HEX parsing, staging writes, and CRC validation.
-* `include/` + `src/` – shared helpers: flash map, low-level FlexSPI wrappers, CRC32, update flag storage, Intel-HEX parser, and application jump shim.
+* `../teensystub/teensystub.ino` – Arduino sketch handling Serial2, Intel-HEX parsing, staging writes, and CRC validation.
+* `../teensystub/*.h/.cpp` – shared helpers: flash map, low-level FlexSPI wrappers, CRC32, update flag storage, Intel-HEX parser, and application jump shim, colocated with the Arduino sketch to satisfy the IDE.
 * `mock/` – lightweight host-side flash emulation plus parser/CRC tests (`test_hex_parser.cpp`).
 * `make_check.py` – command-line tool that checks whether a HEX image fits within the ACTIVE and STAGING slots.
 
@@ -49,5 +49,5 @@ On success the runtime stores the CRC32 and payload size, raises the update flag
 
 * Stage-0 should be compiled separately using the provided linker script so that the binary is copied into ITCM/DTCM at runtime.
 * Stage-1 builds as a regular Teensy 4.1 Arduino sketch.
-* For host verification: `g++ -std=c++17 mock/test_hex_parser.cpp src/crc32.cpp src/intel_hex.cpp src/flash_lowlevel.cpp mock/flash_mock.cpp -Iinclude -Imock && ./a.out`
+* For host verification: `g++ -std=c++17 mock/test_hex_parser.cpp ../teensystub/crc32.cpp ../teensystub/intel_hex.cpp ../teensystub/flash_lowlevel.cpp mock/flash_mock.cpp -I../teensystub -Imock && ./a.out`
 * Before flashing an image, run `./make_check.py <image.hex>` to confirm the layout is valid.

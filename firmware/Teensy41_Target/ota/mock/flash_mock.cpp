@@ -1,7 +1,7 @@
 #include "mock_flash.h"
 
-#include "flash_lowlevel.h"
-#include "flash_map.h"
+#include "../teensystub/flash_lowlevel.h"
+#include "../teensystub/flash_map.h"
 
 #include <cstdlib>
 #include <cstring>

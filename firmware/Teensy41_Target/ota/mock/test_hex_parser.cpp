@@ -1,7 +1,7 @@
-#include "intel_hex.h"
+#include "../teensystub/intel_hex.h"
 
-#include "crc32.h"
-#include "flash_map.h"
+#include "../teensystub/crc32.h"
+#include "../teensystub/flash_map.h"
 #include "mock_flash.h"
 
 #include <cassert>
