@@ -1,290 +1,264 @@
-/*
- * Teensy 4.1 OTA receiver stub (robust handshake)
- * ----------------------------------------------
- * Wiring: Serial2 RX2 (pin 7) <- ESP32 GPIO43, Serial2 TX2 (pin 8) -> ESP32 GPIO44, share GND.
- * Use Arduino Serial Monitor on USB to check logs and firmware version.
- * OTA protocol: HELLO <token> / BEGIN HEX / L <record> / END.
- *
- * NOTE: This stub only verifies the incoming Intel HEX records and acknowledges them so the
- *       ESP32 knows whether the transfer succeeded. Actual flash re-programming is not
- *       performed here—once validation succeeds, a secondary mechanism must still apply the
- *       image. This mirrors the behaviour of the original project where OTA success meant the
- *       HEX file was received and verified without errors.
- */
-
 #include <Arduino.h>
+#include <algorithm>
 #include <cstring>
-#include <strings.h>
+#include <string>
+#include <string_view>
 
-static constexpr uint8_t  LED_PIN    = 13;
-static constexpr uint32_t BAUD_USB  = 115200;   // Serial (USB) to PC
-static constexpr uint32_t BAUD_UART = 115200;   // Serial2 (pins 7/8) to ESP32
-static constexpr char     OTA_TOKEN[] = "8d81ab8762c545dabe699044766a0b72";
-static constexpr char     FW_VERSION[] = "fw-simple-ota-v3";
-static constexpr uint8_t POT_PIN = 27;
+#include "crc32.h"
+#include "flash_lowlevel.h"
+#include "flash_map.h"
+#include "intel_hex.h"
+#include "update_flag.h"
 
-static volatile bool handshake_ready = false;
-static volatile bool hex_in_progress = false;
-static uint32_t hex_lines = 0;
-static uint32_t hex_ok = 0;
-static uint32_t hex_bad = 0;
-static uint32_t hex_bytes = 0;
+using namespace ota;
 
-static inline void resetHexCounters() {
-  hex_lines = hex_ok = hex_bad = hex_bytes = 0;
+namespace
+{
+bool process_record(const HexRecord &record, std::string &error_message);
+
+class StagingWriter
+{
+public:
+    void begin()
+    {
+        std::fill(std::begin(sector_erased_), std::end(sector_erased_), false);
+        current_page_base_ = 0xFFFFFFFFu;
+        page_dirty_ = false;
+    }
+
+    bool write(std::uint32_t address, const std::uint8_t *data, std::size_t length, std::string &error_message)
+    {
+        while (length > 0)
+        {
+            std::uint32_t page_base = (address / FLASH_PAGE_SIZE) * FLASH_PAGE_SIZE;
+            if (page_base != current_page_base_)
+            {
+                flush();
+                current_page_base_ = page_base;
+                std::memset(page_buffer_, 0xFF, sizeof(page_buffer_));
+            }
+
+            if (!ensure_sector_erased(page_base, error_message))
+                return false;
+
+            std::size_t offset = address - page_base;
+            std::size_t chunk = std::min<std::size_t>(FLASH_PAGE_SIZE - offset, length);
+            std::memcpy(page_buffer_ + offset, data, chunk);
+
+            address += chunk;
+            data += chunk;
+            length -= chunk;
+            page_dirty_ = true;
+        }
+        return true;
+    }
+
+    void finalize()
+    {
+        flush();
+    }
+
+private:
+    bool ensure_sector_erased(std::uint32_t address, std::string &error_message)
+    {
+        std::uint32_t index = (address - FLASH_BASE_STAGING) / FLASH_SECTOR_SIZE;
+        if (index >= MAX_STAGING_SECTORS)
+        {
+            error_message = "Staging overflow";
+            return false;
+        }
+        if (!sector_erased_[index])
+        {
+            flash_erase_sector(FLASH_BASE_STAGING + index * FLASH_SECTOR_SIZE);
+            sector_erased_[index] = true;
+        }
+        return true;
+    }
+
+    void flush()
+    {
+        if (page_dirty_ && current_page_base_ != 0xFFFFFFFFu)
+        {
+            flash_program_page(current_page_base_, page_buffer_, FLASH_PAGE_SIZE);
+            page_dirty_ = false;
+        }
+        current_page_base_ = 0xFFFFFFFFu;
+    }
+
+    bool sector_erased_[MAX_STAGING_SECTORS];
+    std::uint32_t current_page_base_ = 0xFFFFFFFFu;
+    bool page_dirty_ = false;
+    std::uint8_t page_buffer_[FLASH_PAGE_SIZE];
+};
+
+StagingWriter staging_writer;
+IntelHexParser *parser = nullptr;
+std::uint32_t running_crc = 0u;
+std::uint32_t image_size = 0;
+std::uint32_t image_base = 0xFFFFFFFFu;
+bool eof_received = false;
+bool update_active = false;
+bool base_is_absolute = false;
+
+bool process_record(const HexRecord &record, std::string &error_message)
+{
+    if (record.type == 0x00 && record.length > 0)
+    {
+        if (!update_active)
+        {
+            error_message = "Data outside of update session";
+            return false;
+        }
+        if (image_base == 0xFFFFFFFFu)
+        {
+            if (record.address >= FLASH_BASE_ACTIVE &&
+                record.address < FLASH_BASE_ACTIVE + FLASH_SIZE_ACTIVE)
+            {
+                image_base = FLASH_BASE_ACTIVE;
+                base_is_absolute = true;
+            }
+            else
+            {
+                image_base = record.address;
+                base_is_absolute = false;
+            }
+        }
+
+        if (!base_is_absolute && record.address < image_base)
+        {
+            error_message = "Non-monotonic address";
+            return false;
+        }
+        if (base_is_absolute && record.address < FLASH_BASE_ACTIVE)
+        {
+            error_message = "Address below active region";
+            return false;
+        }
+
+        std::uint32_t relative = base_is_absolute ? (record.address - FLASH_BASE_ACTIVE)
+                                                  : (record.address - image_base);
+        if (relative + record.length > FLASH_SIZE_STAGING)
+        {
+            error_message = "Image too large for staging";
+            return false;
+        }
+        if (!staging_writer.write(FLASH_BASE_STAGING + relative, record.data, record.length, error_message))
+            return false;
+        running_crc = crc32_update(running_crc, record.data, record.length);
+        image_size = std::max(image_size, relative + static_cast<std::uint32_t>(record.length));
+    }
+    else if (record.type == 0x01)
+    {
+        eof_received = true;
+    }
+    return true;
 }
 
-static int hexNibble(char c) {
-  if (c >= '0' && c <= '9') return c - '0';
-  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-  return -1;
+void reset_state()
+{
+    update_active = false;
+    eof_received = false;
+    image_size = 0;
+    image_base = 0xFFFFFFFFu;
+    running_crc = 0u;
+    base_is_absolute = false;
+    staging_writer.begin();
+    if (parser)
+    {
+        parser->reset();
+    }
 }
 
-static int hexByte(const char* rec, size_t idx) {
-  int hi = hexNibble(rec[idx]);
-  int lo = hexNibble(rec[idx + 1]);
-  if (hi < 0 || lo < 0) return -1;
-  return (hi << 4) | lo;
+void start_update()
+{
+    reset_state();
+    update_active = true;
 }
 
-static bool verifyIntelHex(const char* rec, size_t len, int& payloadLen) {
-  if (len < 11) return false;
-  if (rec[0] != ':') return false;
+void finalize_update()
+{
+    staging_writer.finalize();
+    if (!eof_received || image_size == 0)
+    {
+        Serial2.println("ERR EOF");
+        reset_state();
+        return;
+    }
 
-  int byteCount = hexByte(rec, 1);
-  int addrHigh  = hexByte(rec, 3);
-  int addrLow   = hexByte(rec, 5);
-  int recType   = hexByte(rec, 7);
-  if (byteCount < 0 || addrHigh < 0 || addrLow < 0 || recType < 0) return false;
+    std::uint32_t staging_crc = flash_compute_crc32(FLASH_BASE_STAGING, image_size);
+    if (staging_crc != running_crc)
+    {
+        Serial2.println("ERR CRC");
+        reset_state();
+        return;
+    }
 
-  size_t dataStart = 9;
-  size_t dataEnd   = dataStart + (size_t)byteCount * 2u;
-  if (dataEnd + 2u > len) return false;
-
-  int sum = byteCount + addrHigh + addrLow + recType;
-  for (size_t i = dataStart; i < dataEnd; i += 2) {
-    int b = hexByte(rec, i);
-    if (b < 0) return false;
-    sum += b;
-  }
-  sum = ((~sum + 1) & 0xFF);
-
-  int check = hexByte(rec, dataEnd);
-  if (check < 0) return false;
-
-  if (sum != check) return false;
-  payloadLen = byteCount;
-  return true;
+    write_update_flag(image_size, staging_crc);
+    Serial2.println("OK FLASH");
+    Serial2.flush();
+#ifdef ARDUINO_TEENSY41
+    delay(10);
+    NVIC_SystemReset();
+#endif
 }
 
-static void printStatus() {
-  Serial.printf("HEX lines=%lu ok=%lu bad=%lu bytes=%lu\n", hex_lines, hex_ok, hex_bad, hex_bytes);
+String line_buffer;
+
+void process_line(const String &line)
+{
+    if (line.equalsIgnoreCase("HEX BEGIN"))
+    {
+        start_update();
+        Serial2.println("ACK BEGIN");
+        return;
+    }
+    if (!update_active)
+        return;
+    if (line.length() > 0 && line[0] == ':')
+    {
+        std::string error;
+        if (!parser->feed_line(std::string_view(line.c_str(), line.length()), &error))
+        {
+            Serial2.print("ERR ");
+            Serial2.println(error.c_str());
+            reset_state();
+        }
+        return;
+    }
+    if (line.equalsIgnoreCase("HEX END"))
+    {
+        finalize_update();
+        reset_state();
+        return;
+    }
+}
 }
 
-static void handleUsbConsole() {
-  static char buffer[96];
-  static size_t len = 0;
-
-  while (Serial.available()) {
-    char c = (char)Serial.read();
-    if (c == '\r') continue;
-    if (c != '\n') {
-      if (len + 1 < sizeof(buffer)) {
-        buffer[len++] = c;
-      }
-      continue;
-    }
-
-    buffer[len] = '\0';
-    if (len == 0) { len = 0; continue; }
-
-    if (strcasecmp(buffer, "version") == 0) {
-      Serial.print("FW version: ");
-      Serial.println(FW_VERSION);
-    } else if (strcasecmp(buffer, "status") == 0) {
-      printStatus();
-    } else if (strcasecmp(buffer, "help") == 0) {
-      Serial.println("Commands: version, status, help");
-    } else {
-      Serial.println("Unknown command. Try: version");
-    }
-
-    len = 0;
-  }
+void setup()
+{
+    Serial.begin(115200);
+    Serial2.begin(115200);
+    staging_writer.begin();
+    static IntelHexParser parser_instance(process_record);
+    parser = &parser_instance;
+    Serial2.println("READY");
 }
 
-static void sendLine(const char* s) {
-  Serial2.print(s);
-  Serial2.print('\r');
-  Serial2.print('\n');
-}
-
-static void handleSerial2Line(const char* line) {
-  // Log incoming commands for troubleshooting
-  Serial.print("[Teensy] RX: ");
-  Serial.println(line);
-
-  // Skip empty lines
-  if (!line[0]) return;
-
-  if (strncasecmp(line, "HELLO", 5) == 0) {
-    if (hex_in_progress) {
-      sendLine("BUSY");
-      return;
+void loop()
+{
+    while (Serial2.available())
+    {
+        char c = Serial2.read();
+        if (c == '\r')
+            continue;
+        if (c == '\n')
+        {
+            process_line(line_buffer);
+            line_buffer = "";
+        }
+        else
+        {
+            line_buffer += c;
+        }
     }
-    const char* token = line + 5;
-    while (*token == ' ') token++;
-    if (*token == '\0') {
-      sendLine("NACK");
-      Serial.println("[Teensy] HELLO missing token");
-      return;
-    }
-    if (strcmp(token, OTA_TOKEN) == 0) {
-      handshake_ready = true;
-      Serial.println("[Teensy] HELLO accepted");
-      sendLine("READY");
-    } else {
-      handshake_ready = false;
-      Serial.println("[Teensy] HELLO rejected (token mismatch)");
-      sendLine("NACK");
-    }
-    return;
-  }
-
-  if (strcasecmp(line, "BEGIN HEX") == 0) {
-    if (!handshake_ready || hex_in_progress) {
-      sendLine("HEX IDLE");
-      return;
-    }
-    resetHexCounters();
-    hex_in_progress = true;
-    Serial.println("[Teensy] HEX session begin");
-    sendLine("HEX BEGIN");
-    return;
-  }
-
-  if (strncasecmp(line, "L ", 2) == 0 && hex_in_progress) {
-    const char* rec = line + 2;
-    int payloadLen = 0;
-    bool ok = verifyIntelHex(rec, strlen(rec), payloadLen);
-    hex_lines++;
-    if (ok) {
-      hex_ok++;
-      hex_bytes += (uint32_t)payloadLen;
-      Serial2.print("OK ");
-      Serial2.print(hex_lines);
-      Serial2.print('\r');
-      Serial2.print('\n');
-    } else {
-      hex_bad++;
-      Serial2.print("BAD ");
-      Serial2.print(hex_lines);
-      Serial2.print('\r');
-      Serial2.print('\n');
-    }
-    return;
-  }
-
-  if (strcasecmp(line, "END") == 0) {
-    if (!hex_in_progress) {
-      sendLine("HEX IDLE");
-      return;
-    }
-    hex_in_progress = false;
-    handshake_ready = false;
-
-    if (hex_bad == 0 && hex_ok > 0) {
-      Serial2.print("HEX OK lines=");
-      Serial2.print(hex_ok);
-      Serial2.print(" bytes=");
-      Serial2.print(hex_bytes);
-      Serial2.print('\r');
-      Serial2.print('\n');
-      sendLine("APPLIED");
-      Serial.println("[Teensy] OTA verified (checksum only)");
-    } else {
-      Serial2.print("HEX ERR lines=");
-      Serial2.print(hex_lines);
-      Serial2.print(" bad=");
-      Serial2.print(hex_bad);
-      Serial2.print('\r');
-      Serial2.print('\n');
-      Serial.println("[Teensy] OTA errors detected");
-    }
-    return;
-  }
-
-  if (strcasecmp(line, "PING") == 0) {
-    sendLine("PONG");
-    return;
-  }
-
-  if (strcasecmp(line, "VERSION") == 0) {
-    Serial2.print("FW ");
-    Serial2.print(FW_VERSION);
-    Serial2.print('\r');
-    Serial2.print('\n');
-    return;
-  }
-
-  if (strcasecmp(line, "STATUS") == 0) {
-    Serial2.print("HEX lines=");
-    Serial2.print(hex_lines);
-    Serial2.print(" ok=");
-    Serial2.print(hex_ok);
-    Serial2.print(" bad=");
-    Serial2.print(hex_bad);
-    Serial2.print(" bytes=");
-    Serial2.print(hex_bytes);
-    Serial2.print('\r');
-    Serial2.print('\n');
-    return;
-  }
-
-  sendLine("ERR");
-}
-
-void setup() {
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
-  pinMode(POT_PIN, INPUT);
-  analogReadResolution(12);
-
-  Serial.begin(BAUD_USB);
-  Serial2.begin(BAUD_UART);
-
-  delay(200);
-  Serial.println("\n[Teensy] OTA HEX receiver ready on Serial2 (pins 7/8)");
-  Serial.print("[Teensy] Firmware version: ");
-  Serial.println(FW_VERSION);
-  Serial.println("[Teensy] Type 'version' or 'status' in Serial Monitor for info.");
-}
-
-void loop() {
-  static uint32_t lastBlink = 0;
-  if (millis() - lastBlink >= 500) {
-    lastBlink = millis();
-    digitalWrite(LED_PIN, !digitalRead(LED_PIN));
-  }
-
-  handleUsbConsole();
-
-  static char line[600];
-  static size_t len = 0;
-
-  while (Serial2.available()) {
-    char c = (char)Serial2.read();
-    if (c == '\r') continue;
-    if (c != '\n') {
-      if (len + 1 < sizeof(line)) {
-        line[len++] = c;
-      }
-      continue;
-    }
-
-    line[len] = '\0';
-    handleSerial2Line(line);
-    len = 0;
-  }
 }
