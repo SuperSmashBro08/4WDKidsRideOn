@@ -2436,7 +2436,7 @@ void loop() {
      444:	6823      	ldr	r3, [r4, #0]
      446:	6811      	ldr	r1, [r2, #0]
      448:	1a5b      	subs	r3, r3, r1
-     44a:	2b31      	cmp	r3, #49	; 0x31
+     44a:	2b95      	cmp	r3, #149	; 0x95
      44c:	d912      	bls.n	474 <loop+0x4c>
       t_led = millis();
       led_on = !led_on;
@@ -2552,7 +2552,7 @@ void setup() {
      4fe:	4813      	ldr	r0, [pc, #76]	; (54c <setup+0xbc>)
      500:	f000 febc 	bl	127c <Print::println()>
   OLOG("MyApp FW=%s  (blink=%d ms)", APP_FW_VERSION, BLINK_MS);
-     504:	2232      	movs	r2, #50	; 0x32
+     504:	2296      	movs	r2, #150	; 0x96
      506:	490d      	ldr	r1, [pc, #52]	; (53c <setup+0xac>)
      508:	4811      	ldr	r0, [pc, #68]	; (550 <setup+0xc0>)
      50a:	f7ff ff59 	bl	3c0 <OtaConsole::printf(char const*, ...)>
