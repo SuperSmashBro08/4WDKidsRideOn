@@ -40,7 +40,7 @@ static String htmlEscape(const String& in) {
 
 static String buildIndexPage() {
   String page;
-  page.reserve(2200);
+  page.reserve(2400);
   page += F(
   "<!doctype html><html><head><meta charset='utf-8'>"
   "<meta name=viewport content='width=device-width,initial-scale=1'>"
@@ -85,7 +85,7 @@ static String buildIndexPage() {
     page += F("</pre>");
   }
 
-  // JS: intercept form submit, show upload progress, and redirect back to "/"
+  // JS: progress + resilient finalize (checks /last on success/error/timeout)
   page += F(
   "<script>"
   "const f=document.getElementById('f');"
@@ -94,6 +94,20 @@ static String buildIndexPage() {
   "const bar=document.getElementById('bar');"
   "const fill=document.getElementById('fill');"
   "const status=document.getElementById('status');"
+  "function finalizeUI(ok){"
+    "fill.className = ok ? 'ok' : 'bad';"
+    "status.textContent = ok ? 'Flashing complete. Returning to home…' : 'Upload failed.';"
+    "setTimeout(()=>{ window.location='/'; }, 900);"
+  "}"
+  "async function checkLastAndFinalize(){"
+    "try{"
+      "const r = await fetch('/last',{cache:'no-store'});"
+      "const t = await r.text();"
+      "finalizeUI(t.trim()==='OK');"
+    "}catch(e){"
+      "finalizeUI(false);"
+    "}"
+  "}"
   "f.addEventListener('submit',e=>{"
     "e.preventDefault();"
     "if(!file.files.length){alert('Choose a .hex first');return;}"
@@ -104,19 +118,16 @@ static String buildIndexPage() {
     "fill.className='info';"
     "const xhr=new XMLHttpRequest();"
     "xhr.open('POST','/upload');"
+    "xhr.timeout = 120000;"
     "xhr.upload.onprogress=(ev)=>{"
       "if(ev.lengthComputable){"
         "const pct=Math.round((ev.loaded/ev.total)*100);"
         "fill.style.width=pct+'%';"
       "}else{fill.style.width='100%';}"
     "};"
-    "xhr.onload=()=>{"
-      "const ok=(xhr.status>=200 && xhr.status<300);"
-      "fill.className= ok ? 'ok' : 'bad';"
-      "status.textContent= ok ? 'Flashing complete. Returning to home…' : 'Upload failed.';"
-      "setTimeout(()=>{ window.location='/'; }, 900);"
-    "};"
-    "xhr.onerror=()=>{ fill.className='bad'; status.textContent='Network error.'; btn.disabled=false; };"
+    "xhr.onload=()=>{ checkLastAndFinalize(); };"
+    "xhr.onerror=()=>{ checkLastAndFinalize(); };"
+    "xhr.ontimeout=()=>{ checkLastAndFinalize(); };"
     "const fd=new FormData(f);"
     "xhr.send(fd);"
   "});"
@@ -124,7 +135,6 @@ static String buildIndexPage() {
   "</body></html>");
   return page;
 }
-
 
 static String buildResultPage(bool success, const String& log) {
   String page;
@@ -328,6 +338,11 @@ static void handleVersion() {
   server.send(out.length()?200:504, "text/plain", out.length()?out:"timeout");
 }
 
+// NEW: return OK/ERR for the last OTA result (used by the web UI to finalize)
+static void handleLast() {
+  server.send(200, "text/plain", lastOtaSuccess ? "OK" : "ERR");
+}
+
 static File uploadFile;
 static bool uploadedWasHex = false;
 static String uploadName;
@@ -364,7 +379,9 @@ static void handleUpload() {
     lastOtaMillis = millis();
 
     Serial.println("[OTA RESULT]\n" + log);
-    server.send(ok ? 200 : 500, "text/html", buildResultPage(ok, log));
+
+    // We can return a tiny payload — the JS will check /last anyway.
+    server.send(ok ? 200 : 500, "text/plain", ok ? "OK\n" : "ERR\n");
   }
 }
 
@@ -386,6 +403,7 @@ void setup() {
   server.on("/upload", HTTP_POST, [](){}, handleUpload);
   server.on("/ping", HTTP_GET, handlePing);
   server.on("/version", HTTP_GET, handleVersion);
+  server.on("/last", HTTP_GET, handleLast);   // <— new
   server.begin();
   Serial.println("[HTTP] Server ready.");
 }

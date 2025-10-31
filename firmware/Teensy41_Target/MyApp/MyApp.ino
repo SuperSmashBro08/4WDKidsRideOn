@@ -3,13 +3,13 @@
 #include "OtaConsole.h"
 
 // Bump this each build so you can see updates in logs and in the ESP32 `VERSION` reply
-#define APP_FW_VERSION   "app-0.1.2"
+#define APP_FW_VERSION   "app-0.1.3"
 
 // Pick your test LED (Teensy 4.1 onboard LED is 13)
 #define LED_PIN          13
 
 // Change this value between builds to prove OTA works (e.g., 800 -> 200)
-#define BLINK_MS         50
+#define BLINK_MS         150
 
 void setup() {
   pinMode(LED_PIN, OUTPUT);
