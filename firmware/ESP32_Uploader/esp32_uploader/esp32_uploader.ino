@@ -40,35 +40,91 @@ static String htmlEscape(const String& in) {
 
 static String buildIndexPage() {
   String page;
-  page.reserve(1600);
-  page += F("<!doctype html><html><head><meta charset='utf-8'>"
-            "<meta name=viewport content='width=device-width,initial-scale=1'>"
-            "<title>ESP32 → Teensy OTA</title>"
-            "<style>body{font-family:system-ui;margin:24px;max-width:760px}"
-            "pre{background:#f6f8fa;padding:12px;border-radius:8px;overflow-x:auto}"
-            "code{background:#f6f8fa;padding:2px 6px;border-radius:4px}</style></head><body>");
-  page += F("<h2>ESP32 → Teensy OTA</h2>");
-  page += F("<form method='POST' action='/upload' enctype='multipart/form-data'>"
-            "<p><b>Upload Teensy firmware</b> (<code>.hex</code> from <i>Export compiled Binary</i>)</p>"
-            "<input type='file' name='firmware' accept='.hex' required>"
-            "<p><button type='submit'>Upload & Flash</button></p></form>");
-  page += F("<hr><p><button onclick=\"fetch('/ping').then(r=>r.text()).then(t=>alert(t))\">Ping Teensy</button> "
-            "<button onclick=\"fetch('/version').then(r=>r.text()).then(t=>alert(t))\">Get Version</button></p>");
+  page.reserve(2200);
+  page += F(
+  "<!doctype html><html><head><meta charset='utf-8'>"
+  "<meta name=viewport content='width=device-width,initial-scale=1'>"
+  "<title>ESP32 → Teensy OTA</title>"
+  "<style>"
+    "body{font-family:system-ui;margin:24px;max-width:760px}"
+    "pre{background:#f6f8fa;padding:12px;border-radius:8px;overflow:auto}"
+    "code{background:#f6f8fa;padding:2px 6px;border-radius:4px}"
+    "#bar{width:100%;height:12px;background:#eee;border-radius:6px;overflow:hidden;margin:8px 0 4px 0;display:none}"
+    "#fill{height:100%;width:0%}"
+    ".ok{background:#2ecc71}.bad{background:#e74c3c}.info{background:#3498db}"
+    "button{padding:8px 14px;border:0;border-radius:8px;background:#111;color:#fff;cursor:pointer}"
+    "button[disabled]{opacity:.6;cursor:not-allowed}"
+    "#status{min-height:1.2em}"
+  "</style>"
+  "</head><body><h2>ESP32 → Teensy OTA</h2>"
+  "<form id='f' method='POST' action='/upload' enctype='multipart/form-data'>"
+  "<p><b>Upload Teensy firmware</b> (<code>.hex</code> from <i>Export compiled Binary</i>)</p>"
+  "<input id='file' type='file' name='firmware' accept='.hex' required>"
+  "<p><button id='go' type='submit'>Upload & Flash</button></p>"
+  "<div id='bar'><div id='fill' class='info'></div></div>"
+  "<div id='status'></div>"
+  "</form>"
+  "<hr>"
+  "<p>"
+    "<button onclick=\"fetch('/ping').then(r=>r.text()).then(t=>alert(t)).catch(()=>alert('ping failed'))\">Ping Teensy</button> "
+    "<button onclick=\"fetch('/version').then(r=>r.text()).then(t=>alert(t)).catch(()=>alert('version failed'))\">Get Version</button>"
+  "</p>"
+  );
+
+  // Last result (uses your existing globals)
   if (lastOtaLog.length()) {
     page += lastOtaSuccess ? F("<h3 style='color:#0a0'>Last OTA: success</h3>")
                            : F("<h3 style='color:#b00'>Last OTA: failed</h3>");
     if (lastOtaMillis) {
       page += F("<p><small>Completed ");
-      page += String((millis() - lastOtaMillis)/1000);
+      page += String((millis() - lastOtaMillis) / 1000);
       page += F(" s ago</small></p>");
     }
     page += F("<pre>");
     page += htmlEscape(lastOtaLog);
     page += F("</pre>");
   }
-  page += F("</body></html>");
+
+  // JS: intercept form submit, show upload progress, and redirect back to "/"
+  page += F(
+  "<script>"
+  "const f=document.getElementById('f');"
+  "const btn=document.getElementById('go');"
+  "const file=document.getElementById('file');"
+  "const bar=document.getElementById('bar');"
+  "const fill=document.getElementById('fill');"
+  "const status=document.getElementById('status');"
+  "f.addEventListener('submit',e=>{"
+    "e.preventDefault();"
+    "if(!file.files.length){alert('Choose a .hex first');return;}"
+    "btn.disabled=true;"
+    "status.textContent='Uploading…';"
+    "bar.style.display='block';"
+    "fill.style.width='0%';"
+    "fill.className='info';"
+    "const xhr=new XMLHttpRequest();"
+    "xhr.open('POST','/upload');"
+    "xhr.upload.onprogress=(ev)=>{"
+      "if(ev.lengthComputable){"
+        "const pct=Math.round((ev.loaded/ev.total)*100);"
+        "fill.style.width=pct+'%';"
+      "}else{fill.style.width='100%';}"
+    "};"
+    "xhr.onload=()=>{"
+      "const ok=(xhr.status>=200 && xhr.status<300);"
+      "fill.className= ok ? 'ok' : 'bad';"
+      "status.textContent= ok ? 'Flashing complete. Returning to home…' : 'Upload failed.';"
+      "setTimeout(()=>{ window.location='/'; }, 900);"
+    "};"
+    "xhr.onerror=()=>{ fill.className='bad'; status.textContent='Network error.'; btn.disabled=false; };"
+    "const fd=new FormData(f);"
+    "xhr.send(fd);"
+  "});"
+  "</script>"
+  "</body></html>");
   return page;
 }
+
 
 static String buildResultPage(bool success, const String& log) {
   String page;

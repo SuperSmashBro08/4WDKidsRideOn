@@ -9,7 +9,7 @@
 #define LED_PIN          13
 
 // Change this value between builds to prove OTA works (e.g., 800 -> 200)
-#define BLINK_MS         800
+#define BLINK_MS         50
 
 void setup() {
   pinMode(LED_PIN, OUTPUT);
