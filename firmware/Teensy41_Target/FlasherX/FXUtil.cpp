@@ -3,29 +3,27 @@
 //******************************************************************************
 #include <Arduino.h>
 extern "C" {
-  #include "FlashTxx.h"		// TLC/T3x/T4x/TMM flash primitives
+  #include "FlashTxx.h"         // TLC/T3x/T4x/TMM flash primitives
 }
 
 //******************************************************************************
-// hex_info_t	struct for hex record and hex file info
+// hex_info_t helpers shared across callers
 //******************************************************************************
-typedef struct {	// 
-  char *data;		// pointer to array allocated elsewhere
-  unsigned int addr;	// address in intel hex record
-  unsigned int code;	// intel hex record type (0=data, etc.)
-  unsigned int num;	// number of data bytes in intel hex record
- 
-  uint32_t base;	// base address to be added to intel hex 16-bit addr
-  uint32_t min;		// min address in hex file
-  uint32_t max;		// max address in hex file
-  
-  int eof;		// set true on intel hex EOF (code = 1)
-  int lines;		// number of hex records received  
-} hex_info_t;
-
+void hex_info_reset( hex_info_t *hex, char *data_buf )
+{
+  hex->data  = data_buf;
+  hex->addr  = 0;
+  hex->code  = 0;
+  hex->num   = 0;
+  hex->base  = 0;
+  hex->min   = 0xFFFFFFFF;
+  hex->max   = 0;
+  hex->eof   = 0;
+  hex->lines = 0;
+}
 
 //******************************************************************************
-// hex_info_t	struct for hex record and hex file info
+// Function prototypes
 //******************************************************************************
 void read_ascii_line( Stream *serial, char *line, int maxbytes );
 int  parse_hex_line( const char *theline, char *bytes,
@@ -40,13 +38,11 @@ void update_firmware( Stream *in, Stream *out,
 void update_firmware( Stream *in, Stream *out, 
 				uint32_t buffer_addr, uint32_t buffer_size )
 {
-  static char line[96];					// buffer for hex lines
-  static char data[32] __attribute__ ((aligned (8)));	// buffer for hex data
-  hex_info_t hex = {					// intel hex info struct
-    data, 0, 0, 0,					//   data,addr,num,code
-    0, 0xFFFFFFFF, 0, 					//   base,min,max,
-    0, 0						//   eof,lines
-  };
+  static char line[96];                                 // buffer for hex lines
+  static char data[32] __attribute__ ((aligned (8)));   // buffer for hex data
+  hex_info_t hex;                                       // intel hex info struct
+
+  hex_info_reset( &hex, data );
 
   out->printf( "reading hex lines...\n" );
 
