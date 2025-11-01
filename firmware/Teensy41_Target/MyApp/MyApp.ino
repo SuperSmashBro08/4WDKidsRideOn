@@ -3,7 +3,7 @@
 #include "OtaConsole.h"
 
 // ========== App build tag (shows up in VERSION & logs) ==========
-#define APP_FW_VERSION   "app-0.2.5"
+#define APP_FW_VERSION   "app-0.2.7"
 
 // ========== LED blink just to prove OTA changes ==========
 #define LED_PIN          13
@@ -213,6 +213,7 @@ void setup() {
 
   // OTA forever, logs routed to ESP32 safely
   OtaUpdater::begin(Serial2);
+  OtaUpdater::setAppVersion(APP_FW_VERSION);  
   OtaConsole::begin(Serial2);
 
   Serial.println("[MyApp] boot");
