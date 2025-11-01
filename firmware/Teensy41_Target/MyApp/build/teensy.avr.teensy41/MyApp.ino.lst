@@ -2838,7 +2838,7 @@ void loop() {
      738:	200077f4 	.word	0x200077f4
      73c:	6823      	ldr	r3, [r4, #0]
   g_s1 = analogRead(PIN_POT_S1);
-     73e:	2003      	movs	r0, #3
+     73e:	200e      	movs	r0, #14
      740:	4da9      	ldr	r5, [pc, #676]	; (9e8 <loop+0x448>)
     t_sample = millis();
      742:	6013      	str	r3, [r2, #0]

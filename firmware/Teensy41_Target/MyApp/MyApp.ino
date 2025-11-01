@@ -28,7 +28,7 @@ static constexpr uint8_t PIN_FWD = 10;   // forward switch input (active LOW)
 static constexpr uint8_t PIN_REV = 11;   // reverse switch input (active LOW)
 
 // Local analog (car) pots
-static constexpr uint8_t PIN_POT_S1 = 3;    // Steering 1 (analog)
+static constexpr uint8_t PIN_POT_S1 = 14;    // Steering 1 (analog)
 static constexpr uint8_t PIN_POT_T1 = 27;   // Throttle 1 (analog)
 
 // RC PWM inputs (through CD74HC4050 → 3.3V logic)
