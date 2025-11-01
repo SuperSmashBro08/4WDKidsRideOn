@@ -1,14 +1,3 @@
-/*
- * ESP32-S3 → Teensy 4.1 OTA uploader + Live Console (normalized fields, no filter)
- * -------------------------------------------------------------------------------
- * - Wiring: ESP32 GPIO43 (TX) -> Teensy RX2 pin 7
- *           ESP32 GPIO44 (RX) <- Teensy TX2 pin 8
- *           GND ↔ GND
- * - Web UI at http://<esp32-ip>  | Live console at /console
- * - Console shows one normalized snapshot line ~3–4×/s:
- *   "gear=<Forward|Neutral|Reverse|Fault|—> steer1=<val|—> steer2=<val|—> thr1=<val|—> thr2=<val|—>"
- */
-
 #include <WiFi.h>
 #include <WebServer.h>
 #include <LittleFS.h>
@@ -26,88 +15,14 @@ static String lastOtaLog;
 static bool   lastOtaSuccess = false;
 static unsigned long lastOtaMillis = 0;
 
-// ---------- Live console ring buffer ----------
-static const uint16_t CON_CAP = 500;        // store last ~500 lines
+// ---------- Live console ring buffer (keep exact "S ..." lines) ----------
+static const uint16_t CON_CAP = 500;        // ~500 recent lines
 static String         conBuf[CON_CAP];
-static uint32_t       conId    = 0;         // id of MOST RECENT stored line
-static String         uartLine;             // assembler for UART lines
+static uint32_t       conId    = 0;         // id of most recently stored line
+static String         conLine;              // UART line assembler
 
 static inline void conStore(const String& s) {
-  conId++;
-  conBuf[conId % CON_CAP] = s;
-}
-
-// ---------- Normalized telemetry snapshot ----------
-struct Telemetry {
-  // gear: 0=Unknown,1=Forward,2=Neutral,3=Reverse,4=Fault
-  uint8_t gear = 0;
-  // -1 means unknown; otherwise raw integer from Teensy
-  int steer1 = -1, steer2 = -1, thr1 = -1, thr2 = -1;
-} T;
-
-static const char* gearLabel(uint8_t g) {
-  switch (g) {
-    case 1: return "Forward";
-    case 2: return "Neutral";
-    case 3: return "Reverse";
-    case 4: return "Fault";
-    default: return "—";
-  }
-}
-
-static String nOrDash(int v) { return (v < 0) ? String("—") : String(v); }
-
-// Emit one normalized line every SNAPSHOT_MS
-static const uint32_t SNAPSHOT_MS = 300;
-static uint32_t t_lastSnap = 0;
-
-static void emitSnapshotIfDue() {
-  uint32_t now = millis();
-  if ((now - t_lastSnap) < SNAPSHOT_MS) return;
-  t_lastSnap = now;
-
-  String line;
-  line.reserve(96);
-  line += "gear="; line += gearLabel(T.gear);
-  line += " steer1="; line += nOrDash(T.steer1);
-  line += " steer2="; line += nOrDash(T.steer2);
-  line += " thr1=";   line += nOrDash(T.thr1);
-  line += " thr2=";   line += nOrDash(T.thr2);
-  conStore(line);
-}
-
-// Parse an incoming "S ..." app line and update Telemetry state
-static void parseAppLineAndUpdate(const String& s) {
-  int p;
-
-  // driveDir=
-  p = s.indexOf("driveDir=");
-  if (p >= 0) {
-    int q = s.indexOf(' ', p);
-    String val = (q < 0) ? s.substring(p+9) : s.substring(p+9, q);
-    val.toUpperCase();
-    if      (val == "FWD")   T.gear = 1;
-    else if (val == "NEU")   T.gear = 2;
-    else if (val == "REV")   T.gear = 3;
-    else if (val == "FAULT") T.gear = 4;
-    else                     T.gear = 4; // unknown -> Fault
-  }
-
-  // STEER1 / steer1
-  p = s.indexOf("STEER1="); if (p < 0) p = s.indexOf("steer1=");
-  if (p >= 0) { int q = s.indexOf(' ', p); String v = (q < 0) ? s.substring(p+7) : s.substring(p+7, q); T.steer1 = v.toInt(); }
-
-  // STEER2 / steer2
-  p = s.indexOf("STEER2="); if (p < 0) p = s.indexOf("steer2=");
-  if (p >= 0) { int q = s.indexOf(' ', p); String v = (q < 0) ? s.substring(p+7) : s.substring(p+7, q); T.steer2 = v.toInt(); }
-
-  // THR1 / thr1
-  p = s.indexOf("THR1="); if (p < 0) p = s.indexOf("thr1=");
-  if (p >= 0) { int q = s.indexOf(' ', p); String v = (q < 0) ? s.substring(p+5) : s.substring(p+5, q); T.thr1 = v.toInt(); }
-
-  // THR2 / thr2
-  p = s.indexOf("THR2="); if (p < 0) p = s.indexOf("thr2=");
-  if (p >= 0) { int q = s.indexOf(' ', p); String v = (q < 0) ? s.substring(p+5) : s.substring(p+5, q); T.thr2 = v.toInt(); }
+  ++conId; conBuf[conId % CON_CAP] = s;
 }
 
 // ---------- Small helpers ----------
@@ -125,7 +40,7 @@ static String htmlEscape(const String& in) {
 
 static String buildIndexPage() {
   String page;
-  page.reserve(3000);
+  page.reserve(2800);
   page += F(
   "<!doctype html><html><head><meta charset='utf-8'>"
   "<meta name=viewport content='width=device-width,initial-scale=1'>"
@@ -171,7 +86,6 @@ static String buildIndexPage() {
     page += F("</pre>");
   }
 
-  // progress + resilient finalize
   page += F(
   "<script>"
   "const f=document.getElementById('f');"
@@ -222,6 +136,83 @@ static String buildIndexPage() {
   return page;
 }
 
+// ---------- console UI ----------
+static String buildConsolePage() {
+  String page;
+  page.reserve(2800);
+  page += F(
+    "<!doctype html><html><head><meta charset='utf-8'>"
+    "<meta name=viewport content='width=device-width,initial-scale=1'>"
+    "<title>Teensy Console</title>"
+    "<style>"
+      "body{font-family:system-ui;margin:12px}"
+      "#toolbar{margin-bottom:8px}"
+      "#log{background:#0b1220;color:#d7e0f2;padding:12px;border-radius:8px;"
+           "min-height:70vh;height:70vh;overflow:auto;"
+           "font:13px ui-monospace,Consolas,monospace}"
+      ".line{white-space:pre-wrap;margin:0}"
+      "button{padding:6px 10px;border:0;border-radius:8px;background:#333;color:#fff;margin-right:6px}"
+      "button[disabled]{opacity:.6;cursor:not-allowed}"
+      "a{color:#6cf;text-decoration:none}"
+    "</style>"
+    "</head><body>"
+    "<h3>Teensy Console</h3>"
+    "<p><a href='/'>⬅ Back</a></p>"
+    "<div id='toolbar'>"
+      "<button id='pause'>Pause</button>"
+      "<button id='resume' disabled>Resume</button>"
+      "<button id='clear'>Clear</button>"
+    "</div>"
+    "<div id='log'></div>"
+    "<script>"
+      "let since=0, paused=false;"
+      "const log=document.getElementById('log');"
+      "const MAX_NODES=1200;"
+      "const btnPause=document.getElementById('pause');"
+      "const btnResume=document.getElementById('resume');"
+      "const btnClear=document.getElementById('clear');"
+
+      "btnPause.onclick=()=>{ paused=true; btnPause.disabled=true; btnResume.disabled=false; };"
+      "btnResume.onclick=()=>{ paused=false; btnPause.disabled=false; btnResume.disabled=true; };"
+      "btnClear.onclick=()=>{ log.innerHTML=''; };"
+
+      "let autoScroll=true;"
+      "log.addEventListener('scroll', ()=>{"
+        "autoScroll = (log.scrollTop + log.clientHeight >= log.scrollHeight - 4);"
+      "});"
+
+      "function addLine(text){"
+        "if(!text || paused) return;"
+        "const wasAuto = autoScroll;"
+        "const div=document.createElement('div');"
+        "div.className='line';"
+        "div.textContent=text;"
+        "log.appendChild(div);"
+        "while(log.childNodes.length>MAX_NODES){ log.removeChild(log.firstChild); }"
+        "if(wasAuto){ log.scrollTop = log.scrollHeight; }"
+      "}"
+
+      "function pull(){"
+        "fetch('/tail?since='+since,{cache:'no-store'})"
+        ".then(r=>r.text()).then(t=>{"
+          "const nl=t.indexOf('\\n');"
+          "if(nl>0){"
+            "const hdr=t.substring(0,nl);"
+            "if(hdr.startsWith('NEXT ')){ since=parseInt(hdr.substring(5))||since; }"
+            "const body=t.substring(nl+1);"
+            "const lines=body.split('\\n').filter(Boolean);"
+            "for(let i=0;i<lines.length;i++){ addLine(lines[i]); }"
+          "}"
+        "}).catch(()=>{});"
+      "}"
+      "setInterval(pull, 300);"
+    "</script>"
+    "</body></html>"
+  );
+  return page;
+}
+
+// ---------- helpers ----------
 static void ensureLittleFS() {
   if (!LittleFS.begin(true)) Serial.println("[FS] LittleFS mount failed");
   else                       Serial.println("[FS] LittleFS mounted");
@@ -242,20 +233,54 @@ static void connectWifi() {
   else Serial.println("[mDNS] start failed");
 }
 
-// Read a line from Teensy (CRLF tolerant); trims trailing spaces
+// Read a line from Teensy (CRLF tolerant)
 static bool readLineFrom(Stream& s, String& out, uint32_t to_ms=3000) {
   out = ""; unsigned long t0 = millis();
   while (millis()-t0 < to_ms) {
     while (s.available()) {
-      char c = (char)SerialTeensy.read(); // always read the HW serial
+      char c = (char)s.read();
       if (c=='\r') continue;
       if (c=='\n') { out.trim(); return true; }
-      if (out.length() < 240) out += c;
+      if (out.length() < 400) out += c;
     }
     delay(1); yield();
   }
   out.trim();
   return out.length() > 0;
+}
+
+// Pump Teensy UART into ring buffer; store only exact lines that start with "S "
+static void pumpTeensyConsole() {
+  while (SerialTeensy.available()) {
+    char c = (char)SerialTeensy.read();
+    if (c == '\r') continue;
+    if (c == '\n') {
+      conLine.trim();
+      if (conLine.length() >= 2 && conLine[0] == 'S' && conLine[1] == ' ') {
+        // Store the full line as-is (keep leading "S ")
+        conStore(conLine);
+      }
+      conLine = "";
+    } else {
+      if (conLine.length() < 512) conLine += c;
+    }
+  }
+}
+
+// ---------- flashing helpers (unchanged, omitted comments for brevity) ----------
+static bool validateHexFile(File& f, String& err) {
+  if (!f) { err="open failed"; return false; }
+  if (!f.size()) { err="empty file"; return false; }
+  size_t pos = f.position();
+  String first = f.readStringUntil('\n'); first.trim();
+  while (first.length()==0 && f.available()) { first = f.readStringUntil('\n'); first.trim(); }
+  if (first.length()==0 || first[0] != ':') { err="not Intel HEX (no leading colon)"; f.seek(pos); return false; }
+  f.seek(0);
+  String line, lastNonEmpty;
+  while (f.available()) { line = f.readStringUntil('\n'); line.trim(); if (line.length()) lastNonEmpty = line; }
+  f.seek(0);
+  if (lastNonEmpty != ":00000001FF") { err = "missing EOF (:00000001FF)"; return false; }
+  return true;
 }
 
 static bool expectStartsWith(Stream& s, const char* prefix, String* captured=nullptr, uint32_t to_ms=3000) {
@@ -265,47 +290,6 @@ static bool expectStartsWith(Stream& s, const char* prefix, String* captured=nul
   return line.startsWith(prefix);
 }
 
-// Validate file looks like Intel HEX and ends with EOF
-static bool validateHexFile(File& f, String& err) {
-  if (!f) { err="open failed"; return false; }
-  if (!f.size()) { err="empty file"; return false; }
-
-  // First non-empty line must start with ':'
-  size_t pos = f.position();
-  String first = f.readStringUntil('\n'); first.trim();
-  while (first.length()==0 && f.available()) { first = f.readStringUntil('\n'); first.trim(); }
-  if (first.length()==0 || first[0] != ':') { err="not Intel HEX (no leading colon)"; f.seek(pos); return false; }
-
-  // Scan to last non-empty line for EOF check
-  f.seek(0);
-  String line, lastNonEmpty;
-  while (f.available()) {
-    line = f.readStringUntil('\n'); line.trim();
-    if (line.length()) lastNonEmpty = line;
-  }
-  f.seek(0);
-  if (lastNonEmpty != ":00000001FF") { err = "missing EOF (:00000001FF)"; return false; }
-  return true;
-}
-
-// Pump Teensy UART: consume "S " lines, update Telemetry (no raw stores)
-static void pumpTeensyConsole() {
-  while (SerialTeensy.available()) {
-    char c = (char)SerialTeensy.read();
-    if (c == '\r') continue;
-    if (c == '\n') {
-      uartLine.trim();
-      if (uartLine.length() >= 2 && uartLine[0] == 'S' && uartLine[1] == ' ') {
-        parseAppLineAndUpdate(uartLine);
-      }
-      uartLine = "";
-    } else {
-      if (uartLine.length() < 512) uartLine += c;
-    }
-  }
-}
-
-// Flash Teensy from LittleFS
 static bool flashTeensyFromFS(const char* path, String& logOut) {
   File f = LittleFS.open(path, FILE_READ);
   String vErr;
@@ -314,28 +298,34 @@ static bool flashTeensyFromFS(const char* path, String& logOut) {
   const size_t totalBytes = f.size();
   size_t sentBytes = 0;
   auto logProgress = [&](size_t extra){ sentBytes += extra; if (totalBytes) {
-    int pct = (int)( (100ULL * sentBytes) / totalBytes );
-    logOut += "PROGRESS " + String(pct) + "% (" + String(sentBytes) + "/" + String(totalBytes) + ")\n";
-  }};
+      int pct = (int)( (100ULL * sentBytes) / totalBytes );
+      logOut += "PROGRESS " + String(pct) + "% (" + String(sentBytes) + "/" + String(totalBytes) + ")\n";
+    }};
 
   while (SerialTeensy.available()) SerialTeensy.read();
 
   SerialTeensy.printf("HELLO %s\r\n", OTA_TOKEN);
   logOut += "Sent HELLO\n";
 
-  String resp; bool helloOk = false; uint8_t attempts = 0;
+  String resp;
+  bool helloOk = false;
+  uint8_t attempts = 0;
   unsigned long t_deadline = millis() + 4000;
 
   while (millis() < t_deadline && attempts < 3) {
     if (!readLineFrom(SerialTeensy, resp, 800)) {
-      attempts++; SerialTeensy.printf("HELLO %s\r\n", OTA_TOKEN); logOut += "HELLO timeout, retrying...\n"; continue;
+      attempts++;
+      SerialTeensy.printf("HELLO %s\r\n", OTA_TOKEN);
+      logOut += "HELLO timeout, retrying...\n";
+      continue;
     }
     logOut += "<- " + resp + "\n";
     if (resp == "READY") { helloOk = true; break; }
     if (resp == "BUSY")  { delay(250); continue; }
     if (resp == "NACK")  { logOut += "Token mismatch (NACK)\n"; break; }
     if (resp.startsWith("S ") || resp.startsWith("FW ") || resp.startsWith("FLASHERX ")) continue;
-    if (resp == "ERR") { attempts++; SerialTeensy.printf("HELLO %s\r\n", OTA_TOKEN); logOut += "HELLO got ERR, retrying...\n"; continue; }
+    if (resp == "ERR") { attempts++; SerialTeensy.printf("HELLO %s\r\n", OTA_TOKEN);
+      logOut += "HELLO got ERR, retrying...\n"; continue; }
     logOut += "Unexpected during HELLO: " + resp + "\n";
   }
   if (!helloOk) { f.close(); return false; }
@@ -366,9 +356,7 @@ static bool flashTeensyFromFS(const char* path, String& logOut) {
       ok++;
     } else if (ack.startsWith("BAD ")) {
       bad++; logOut += "Teensy reported BAD at line " + String(lineNumber) + "\n"; break;
-    } else {
-      bad++; logOut += "Unexpected reply at line " + String(lineNumber) + ": " + ack + "\n"; break;
-    }
+    } else { bad++; logOut += "Unexpected reply at line " + String(lineNumber) + ": " + ack + "\n"; break; }
 
     logProgress(rec.length()+3);
     delayMicroseconds(lineDelayUs);
@@ -388,15 +376,11 @@ static bool flashTeensyFromFS(const char* path, String& logOut) {
     if (summary.startsWith("HEX OK")) success = true;
     if (summary=="APPLIED" || summary.startsWith("HEX ERR")) break;
   }
-
   return success && (bad==0);
 }
 
 // ---------- HTTP handlers ----------
-static String buildConsolePage(); // forward
-
 static void handleRoot() { server.send(200, "text/html", buildIndexPage()); }
-static void handleLast() { server.send(200, "text/plain", lastOtaSuccess ? "OK" : "ERR"); }
 
 static void handlePing() {
   while (SerialTeensy.available()) SerialTeensy.read();
@@ -415,105 +399,14 @@ static void handleVersion() {
   server.send(out.length()?200:504, "text/plain", out.length()?out:"timeout");
 }
 
-// Console page with Pause/Resume and Clear (no filter)
+static void handleLast() { server.send(200, "text/plain", lastOtaSuccess ? "OK" : "ERR"); }
+
 static void handleConsolePage() { server.send(200, "text/html", buildConsolePage()); }
 
-static String buildConsolePage() {
-  String page;
-  page.reserve(4000);
-  page += F(
-    "<!doctype html><html><head><meta charset='utf-8'>"
-    "<meta name=viewport content='width=device-width,initial-scale=1'>"
-    "<title>Teensy Console</title>"
-    "<style>"
-      "body{font-family:system-ui;margin:12px}"
-      "#toolbar{display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap}"
-      "#log{background:#0b1220;color:#d7e0f2;padding:12px;border-radius:8px;"
-           "min-height:70vh;height:70vh;overflow:auto;"
-           "font:13px ui-monospace,Consolas,monospace}"
-      ".line{white-space:pre-wrap;margin:0}"
-      "button{padding:6px 12px;border:0;border-radius:8px;background:#111;color:#fff;cursor:pointer}"
-      ".muted{opacity:.6}"
-      "a{color:#6cf;text-decoration:none}"
-    "</style>"
-    "</head><body>"
-    "<h3>Teensy Console</h3>"
-    "<div id='toolbar'>"
-      "<button id='pause'>Pause</button>"
-      "<button id='clear'>Clear</button>"
-      "<span id='status' class='muted'></span>"
-    "</div>"
-    "<div id='log'></div>"
-    "<p><a href='/'>⬅ Back</a></p>"
-    "<script>"
-      "let since=0;"
-      "const log=document.getElementById('log');"
-      "const btnPause=document.getElementById('pause');"
-      "const btnClear=document.getElementById('clear');"
-      "const statusEl=document.getElementById('status');"
-      "const MAX_NODES=1200;"
-      "let paused = (localStorage.getItem('console_paused')==='1');"
-      "if (paused) btnPause.textContent='Resume';"
-      "function setStatus(){ statusEl.textContent = paused?'PAUSED':'LIVE'; }"
-      "setStatus();"
-
-      "let autoScroll=true;"
-      "log.addEventListener('scroll', ()=>{"
-        "autoScroll = (log.scrollTop + log.clientHeight >= log.scrollHeight - 4);"
-      "});"
-
-      "function addLine(text){"
-        "if(!text) return;"
-        "const wasAuto = autoScroll;"
-        "const div=document.createElement('div');"
-        "div.className='line';"
-        "div.textContent=text;"
-        "log.appendChild(div);"
-        "while(log.childNodes.length>MAX_NODES){ log.removeChild(log.firstChild); }"
-        "if(wasAuto){ log.scrollTop = log.scrollHeight; }"
-      "}"
-
-      "function fetchOnce(sinceParam){"
-        "return fetch('/tail?since='+sinceParam,{cache:'no-store'})"
-          ".then(r=>r.text()).then(t=>{"
-            "const nl=t.indexOf('\\n');"
-            "if(nl>0){"
-              "const hdr=t.substring(0,nl);"
-              "if(hdr.startsWith('NEXT ')){ since=parseInt(hdr.substring(5))||since; }"
-              "const body=t.substring(nl+1);"
-              "const lines=body.split('\\n').filter(Boolean);"
-              "for(let i=0;i<lines.length;i++){ addLine(lines[i]); }"
-            "}"
-          "});"
-      "}"
-
-      "function pull(){ if(!paused){ fetchOnce(since).catch(()=>{}); } }"
-      "setInterval(pull, 250);"
-
-      "btnPause.addEventListener('click', ()=>{"
-        "paused=!paused;"
-        "localStorage.setItem('console_paused', paused?'1':'0');"
-        "btnPause.textContent = paused ? 'Resume' : 'Pause';"
-        "setStatus();"
-        "if(!paused){ pull(); }"
-      "});"
-
-      "btnClear.addEventListener('click', ()=>{ log.textContent=''; });"
-
-      "// Initial load"
-      "fetchOnce(0).catch(()=>{});"
-    "</script>"
-    "</body></html>"
-  );
-  return page;
-}
-
-// Tail endpoint
+// Tail endpoint polled by the console
 static void handleTail() {
   uint32_t since = 0;
-  if (server.hasArg("since")) {
-    since = (uint32_t) strtoul(server.arg("since").c_str(), nullptr, 10);
-  }
+  if (server.hasArg("since")) since = (uint32_t) strtoul(server.arg("since").c_str(), nullptr, 10);
 
   const uint16_t MAX_LINES = 200;
   uint32_t curId = conId;
@@ -526,22 +419,17 @@ static void handleTail() {
   uint32_t start = since + 1;
   if (start + MAX_LINES < curId) start = curId - MAX_LINES;
 
-  String out;
-  out.reserve(4096);
-  out += "NEXT ";
-  out += String(curId);
-  out += "\n";
+  String out; out.reserve(4096);
+  out += "NEXT "; out += String(curId); out += "\n";
 
   for (uint32_t id = start; id <= curId; ++id) {
     if ((curId - id) >= CON_CAP) continue; // fell out of ring
     const String& line = conBuf[id % CON_CAP];
     if (line.length()) {
-      out += line;
-      out += "\n";
+      out += line; out += "\n";
       if (out.length() > 60000) break;
     }
   }
-
   server.send(200, "text/plain", out);
 }
 
@@ -581,7 +469,6 @@ static void handleUpload() {
     lastOtaMillis = millis();
 
     Serial.println("[OTA RESULT]\n" + log);
-
     server.send(ok ? 200 : 500, "text/plain", ok ? "OK\n" : "ERR\n");
   }
 }
@@ -590,7 +477,7 @@ static void handleUpload() {
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n== ESP32 → Teensy OTA + Console (normalized, no filter) ==");
+  Serial.println("\n== ESP32 → Teensy OTA + Console ==");
 
   ensureLittleFS();
   connectWifi();
@@ -612,16 +499,9 @@ void setup() {
 }
 
 void loop() {
-  // 1) consume Teensy UART into telemetry state
   pumpTeensyConsole();
-
-  // 2) periodically emit one normalized summary line
-  emitSnapshotIfDue();
-
-  // 3) serve HTTP
   server.handleClient();
 
-  // 4) Wi-Fi watchdog
   static unsigned long lastCheck = 0;
   if (millis()-lastCheck > 3000) {
     lastCheck = millis();
