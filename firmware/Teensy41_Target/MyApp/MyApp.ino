@@ -16,16 +16,16 @@ enum Direction : uint8_t;   // forward declare
 struct Desired;              // forward declare
 
 // ========== App build tag ==========
-#define APP_FW_VERSION   "V 3.1.1"
+#define APP_FW_VERSION   "V 3.1.2"
 
 // ========== LED blink ==========
 #define LED_PIN          13
-#define BLINK_MS         1000
+#define BLINK_MS         500
 
 // ========== IO PINS ==========
 // Gear F/N/R switch inputs (active LOW with pullups)
-static constexpr uint8_t PIN_FWD = 10;   // forward switch input (active LOW)
-static constexpr uint8_t PIN_REV = 11;   // reverse switch input (active LOW)
+static constexpr uint8_t PIN_FWD = 11;   // forward switch input (active LOW)
+static constexpr uint8_t PIN_REV = 10;   // reverse switch input (active LOW)
 
 // Local analog (car) pots
 static constexpr uint8_t PIN_POT_S1 = 14;    // Steering 1 (analog)
