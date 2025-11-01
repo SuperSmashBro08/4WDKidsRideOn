@@ -8,7 +8,7 @@ enum Direction : uint8_t;   // forward declare
 struct Desired;              // forward declare
 
 // ========== App build tag ==========
-#define APP_FW_VERSION   "app-0.2.15-gear-only"
+#define APP_FW_VERSION   "app-0.2.16-gear-only"
 
 // ========== LED blink ==========
 #define LED_PIN          13
