@@ -2851,14 +2851,14 @@ void loop() {
      750:	4fa6      	ldr	r7, [pc, #664]	; (9ec <loop+0x44c>)
      752:	4603      	mov	r3, r0
   const bool fwd_low = (digitalRead(PIN_FWD) == LOW);
-     754:	200a      	movs	r0, #10
+     754:	200b      	movs	r0, #11
   g_t1 = analogRead(PIN_POT_T1);
      756:	803b      	strh	r3, [r7, #0]
   const bool fwd_low = (digitalRead(PIN_FWD) == LOW);
      758:	f001 fc00 	bl	1f5c <digitalRead>
      75c:	4606      	mov	r6, r0
   const bool rev_low = (digitalRead(PIN_REV) == LOW);
-     75e:	200b      	movs	r0, #11
+     75e:	200a      	movs	r0, #10
      760:	f001 fbfc 	bl	1f5c <digitalRead>
   if ( fwd_low &&  rev_low) g_fnr = FNR_FAULT;
      764:	ea46 0300 	orr.w	r3, r6, r0
@@ -3227,7 +3227,7 @@ void setup() {
      a8a:	f001 fa3d 	bl	1f08 <digitalWrite>
   pinMode(PIN_FWD, INPUT_PULLUP);
      a8e:	2102      	movs	r1, #2
-     a90:	200a      	movs	r0, #10
+     a90:	200b      	movs	r0, #11
 	// Testing Serial as a boolean indicates whether USB is active and a program
 	// running on your PC has raised the DTR signal, which typically means it has
 	// opened the port and is ready to communicate.
@@ -3238,7 +3238,7 @@ void setup() {
      a94:	f001 fa74 	bl	1f80 <pinMode>
   pinMode(PIN_REV, INPUT_PULLUP);
      a98:	2102      	movs	r1, #2
-     a9a:	200b      	movs	r0, #11
+     a9a:	200a      	movs	r0, #10
 		((uint32_t)(systick_millis_count - usb_cdc_line_rtsdtr_millis) >= 15);
      a9c:	f8df 910c 	ldr.w	r9, [pc, #268]	; bac <setup+0x138>
      aa0:	f001 fa6e 	bl	1f80 <pinMode>
@@ -3323,10 +3323,10 @@ static inline void analogReadResolution(unsigned int bits) { analogReadRes(bits)
      b38:	200a      	movs	r0, #10
      b3a:	f001 f967 	bl	1e0c <delay>
         (int)digitalRead(PIN_FWD), (int)digitalRead(PIN_REV));
-     b3e:	200a      	movs	r0, #10
+     b3e:	200b      	movs	r0, #11
      b40:	f001 fa0c 	bl	1f5c <digitalRead>
      b44:	4601      	mov	r1, r0
-     b46:	200b      	movs	r0, #11
+     b46:	200a      	movs	r0, #10
      b48:	9101      	str	r1, [sp, #4]
      b4a:	f001 fa07 	bl	1f5c <digitalRead>
   SLOGF("S BOOT_PINS fwd=%d rev=%d (0=LOW,1=HIGH)\r\n",
