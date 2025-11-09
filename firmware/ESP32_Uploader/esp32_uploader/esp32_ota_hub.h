@@ -137,6 +137,103 @@ namespace {
   static uint32_t        telemetryDropCount = 0;
   static uint32_t        telemetryUpdatedMs = 0;
 
+  enum class TelemetryState : uint8_t { WaitMagic0, WaitMagic1, WaitVersion, WaitLength, ReadPayload, SkipPayload };
+
+  struct TelemetryParser {
+    TelemetryState state = TelemetryState::WaitMagic0;
+    uint8_t        curVersion = 0;
+    uint8_t        curLength  = 0;
+    uint8_t        payload[TELEM_MAX_PAYLOAD] = {};
+    uint8_t        pos = 0;
+    uint8_t        skip = 0;
+  };
+
+  static TelemetryParser telemParser;
+
+  static inline void telemetryResetParser(){ telemParser = TelemetryParser{}; }
+
+  static bool telemetryConsumeByte(uint8_t b){
+    TelemetryParser& p = telemParser;
+
+    switch (p.state){
+      case TelemetryState::WaitMagic0:
+        if (b == TELEM_MAGIC0){
+          p.state = TelemetryState::WaitMagic1;
+          return true;
+        }
+        return false;
+
+      case TelemetryState::WaitMagic1:
+        if (b == TELEM_MAGIC1){
+          p.state = TelemetryState::WaitVersion;
+          return true;
+        }
+        p.state = TelemetryState::WaitMagic0;
+        return false;
+
+      case TelemetryState::WaitVersion:
+        p.curVersion = b;
+        p.state = TelemetryState::WaitLength;
+        return true;
+
+      case TelemetryState::WaitLength:
+        p.curLength = b;
+        if (p.curLength == 0){
+          p.state = TelemetryState::WaitMagic0;
+          return true;
+        }
+        if (p.curLength > TELEM_MAX_PAYLOAD){
+          p.skip = p.curLength;
+          p.state = TelemetryState::SkipPayload;
+          return true;
+        }
+        p.pos = 0;
+        p.state = TelemetryState::ReadPayload;
+        return true;
+
+      case TelemetryState::ReadPayload:
+        p.payload[p.pos++] = b;
+        if (p.pos >= p.curLength){
+          if (p.curVersion == TELEM_VERSION && p.curLength == sizeof(TelemetryPayload)){
+            memcpy(&latestTelem.payload, p.payload, sizeof(TelemetryPayload));
+            latestTelem.magic0 = TELEM_MAGIC0;
+            latestTelem.magic1 = TELEM_MAGIC1;
+            latestTelem.version = p.curVersion;
+            latestTelem.length  = p.curLength;
+            telemetryValid      = true;
+            telemetryUpdatedMs  = millis();
+            uint16_t seq        = latestTelem.payload.seq;
+            if (telemetryHasSeq){
+              uint16_t delta = (uint16_t)(seq - telemetryLastSeq);
+              if (delta > 1) telemetryDropCount += (uint32_t)(delta - 1);
+            }
+            telemetryLastSeq = seq;
+            telemetryHasSeq  = true;
+          }
+          p.state = TelemetryState::WaitMagic0;
+        }
+        return true;
+
+      case TelemetryState::SkipPayload:
+        if (p.skip){
+          --p.skip;
+          if (!p.skip) p.state = TelemetryState::WaitMagic0;
+        }
+        return true;
+    }
+
+    p.state = TelemetryState::WaitMagic0;
+    return false;
+  }
+
+  static void drainTeensyInput(){
+    while (SerialTeensy.available()){
+      int raw = SerialTeensy.read();
+      if (raw < 0) break;
+      telemetryConsumeByte((uint8_t)raw);
+    }
+  }
+
   // ----- Utilities -----
   static inline void conStore(const String& s){ ++conId; conBuf[conId % CON_CAP] = s; }
   static inline void eConStore(const String& s){ ++eConId; eConBuf[eConId % E_CON_CAP] = s; }
@@ -196,7 +293,12 @@ namespace {
     out=""; unsigned long t0=millis();
     while(millis()-t0<to_ms){
       while(s.available()){
-        char c=(char)s.read();
+        int raw = s.read();
+        if (raw < 0) break;
+        uint8_t byte = (uint8_t)raw;
+        if (telemetryConsumeByte(byte)) { t0 = millis(); continue; }
+        if ((byte < 0x20 && byte != '\n' && byte != '\r') || byte >= 0x7F) { t0 = millis(); continue; }
+        char c = (char)byte;
         if(c=='\r') continue;
         if(c=='\n'){ out.trim(); return true; }
         if(out.length()<400) out+=c;
@@ -408,7 +510,7 @@ namespace {
       }
     };
 
-    while (SerialTeensy.available()) SerialTeensy.read();
+    drainTeensyInput();
 
     SerialTeensy.printf("HELLO %s\r\n", HUB_OTA_TOKEN.c_str());
     logOut += "Sent HELLO\n";
@@ -863,13 +965,13 @@ namespace {
 
   // Teensy quick commands
   static void handlePing(){
-    while(SerialTeensy.available()) SerialTeensy.read();
+    drainTeensyInput();
     SerialTeensy.print("PING\r\n");
     String r; if (readLineFrom(SerialTeensy, r, 800)) server.send(200,"text/plain",r);
     else server.send(504,"text/plain","timeout");
   }
   static void handleVersion(){
-    while(SerialTeensy.available()) SerialTeensy.read();
+    drainTeensyInput();
     SerialTeensy.print("VERSION\r\n");
     String a,b,o;
     if (readLineFrom(SerialTeensy,a,800)) o+=a+"\n";
@@ -1105,6 +1207,7 @@ void begin(const char* wifiSsid, const char* wifiPass, const char* otaToken,
   SerialTeensy.setRxBufferSize(4096);
   SerialTeensy.setTxBufferSize(1024);
   SerialTeensy.begin(230400, SERIAL_8N1, TEENSY_RX, TEENSY_TX);
+  telemetryResetParser();
   Serial.printf("[UART] SerialTeensy on RX=%d TX=%d @230400\n", TEENSY_RX, TEENSY_TX);
   ELOGF("UART to Teensy: RX=%d TX=%d @230400", TEENSY_RX, TEENSY_TX);
 
