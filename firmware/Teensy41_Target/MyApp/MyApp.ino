@@ -54,8 +54,8 @@ static inline bool throttleInhibitActive();
 enum FnrState : uint8_t { FNR_NEU=0, FNR_FWD=1, FNR_REV=2, FNR_FAULT=3 };
 static FnrState g_fnr = FNR_NEU;
 static inline const char* fnrWord(FnrState s){
-  switch(s){ case FNR_FWD: return "Forward"; case FNR_REV: return "Reverse";
-             case FNR_NEU: return "Neutral"; default: return "Fault"; }
+  switch(s){ case FNR_FWD: return "forward"; case FNR_REV: return "reverse";
+             case FNR_NEU: return "neutral"; default: return "fault"; }
 }
 
 // ===== Live values =====
@@ -198,36 +198,41 @@ static inline const char* steerToText(SteeringPos s){
 }
 static inline const char* t1ToText(Throttle1DirLv t){
   switch(t){
-    case Throttle1DirLv::RevHigh: return "reverse-high";
-    case Throttle1DirLv::RevMed:  return "reverse-medium";
-    case Throttle1DirLv::RevLow:  return "reverse-low";
+    case Throttle1DirLv::RevHigh: return "reverse high";
+    case Throttle1DirLv::RevMed:  return "reverse medium";
+    case Throttle1DirLv::RevLow:  return "reverse low";
     case Throttle1DirLv::Off:     return "off";
-    case Throttle1DirLv::FwdLow:  return "forward-low";
-    case Throttle1DirLv::FwdMed:  return "forward-medium";
-    default:                      return "forward-high";
+    case Throttle1DirLv::FwdLow:  return "forward low";
+    case Throttle1DirLv::FwdMed:  return "forward medium";
+    default:                      return "forward high";
   }
 }
 static inline const char* t2ToText(Throttle2Lvl t){
   switch(t){
-    case Throttle2Lvl::RevHigh: return "reverse-high";
-    case Throttle2Lvl::RevMed:  return "reverse-medium";
-    case Throttle2Lvl::RevLow:  return "reverse-low";
+    case Throttle2Lvl::RevHigh: return "reverse high";
+    case Throttle2Lvl::RevMed:  return "reverse medium";
+    case Throttle2Lvl::RevLow:  return "reverse low";
     case Throttle2Lvl::Off:     return "off";
-    case Throttle2Lvl::FwdLow:  return "forward-low";
-    case Throttle2Lvl::FwdMed:  return "forward-medium";
-    default:                    return "forward-high";
+    case Throttle2Lvl::FwdLow:  return "forward low";
+    case Throttle2Lvl::FwdMed:  return "forward medium";
+    default:                    return "forward high";
   }
 }
 
-// ===== Channel classifiers (median + K-consecutive) =====
-template<typename Tok, uint8_t K>
-struct EventOnly {
-  Tok cur{}; Tok runTok{}; uint8_t runLen{0}; bool init{false};
-  bool push(Tok incoming){
-    if(!init){ init=true; cur=incoming; runTok=incoming; runLen=1; return true; } // print initial
-    if(incoming==cur){ runTok=incoming; runLen=1; return false; }                 // stable same, ignore
-    if(incoming!=runTok){ runTok=incoming; runLen=1; return false; }              // new candidate
-    if(++runLen >= K){ cur=runTok; runLen=0; return true; }                       // accept change
+// ===== Channel classifiers (median + stability hold) =====
+template<typename Tok, uint16_t HoldMs>
+struct StableLatch {
+  Tok cur{};
+  Tok pending{};
+  bool init{false};
+  bool hasPending{false};
+  uint32_t pendingStart{0};
+
+  bool push(Tok incoming, uint32_t nowMs){
+    if(!init){ cur=incoming; init=true; hasPending=false; pending=incoming; pendingStart=nowMs; return true; }
+    if(incoming==cur){ hasPending=false; return false; }
+    if(!hasPending || incoming!=pending){ pending=incoming; pendingStart=nowMs; hasPending=true; return false; }
+    if((uint32_t)(nowMs - pendingStart) >= HoldMs){ cur=pending; hasPending=false; return true; }
     return false;
   }
 };
@@ -237,11 +242,11 @@ static Median<uint16_t,8> medT1;
 static Median<int16_t,8>  medS2;   // mapped to -1000..+1000 before push
 static Median<int16_t,8>  medT2;   // mapped to 0..1000 before push
 
-static EventOnly<SteeringPos,3>    evS1; // needs 3 consecutive identical tokens
-static EventOnly<SteeringPos,3>    evS2;
-static EventOnly<Throttle1DirLv,3> evT1;
-static EventOnly<Throttle2Lvl,3>   evT2;
-static EventOnly<FnrState,3>       evG;
+static StableLatch<SteeringPos,200>    latchS1;
+static StableLatch<SteeringPos,200>    latchS2;
+static StableLatch<Throttle1DirLv,250> latchT1;
+static StableLatch<Throttle2Lvl,250>   latchT2;
+static StableLatch<FnrState,150>       latchGear;
 
 // map functions use your bins
 static inline SteeringPos mapSteering1(uint16_t raw){
@@ -260,9 +265,7 @@ static inline ThrottleLvl mapThrottle1Level(uint16_t raw){
   if(raw <= g_bins.t1_med_max)   return ThrottleLvl::Medium;
   return ThrottleLvl::High;
 }
-static inline Throttle1DirLv mapThrottle1Dir(uint16_t raw, FnrState gear){
-  if (throttleInhibitActive()) return Throttle1DirLv::Off;
-  ThrottleLvl lvl=mapThrottle1Level(raw);
+static inline Throttle1DirLv mapThrottle1Dir(ThrottleLvl lvl, FnrState gear){
   if(lvl==ThrottleLvl::Off) return Throttle1DirLv::Off;
   if(gear==FNR_NEU || gear==FNR_FAULT) return Throttle1DirLv::Off;
   if(gear==FNR_FWD){
@@ -327,16 +330,26 @@ static void tickEventPipeline(){
   // 3) classify medians
   SteeringPos s1Tok = mapSteering1(medS1.get());
   SteeringPos s2Tok = mapSteering2_val(medS2.get());
-  Throttle1DirLv t1Tok = mapThrottle1Dir(medT1.get(), g_fnr);
+  ThrottleLvl t1Lvl = mapThrottle1Level(medT1.get());
+  if (throttleInhibitActive()) t1Lvl = ThrottleLvl::Off;
+  if (g_fnr==FNR_NEU || g_fnr==FNR_FAULT) t1Lvl = ThrottleLvl::Off;
+  Throttle1DirLv t1Tok = mapThrottle1Dir(t1Lvl, g_fnr);
   Throttle2Lvl   t2Tok = mapThrottle2_val(medT2.get());
   FnrState       gTok  = g_fnr;
 
-  // 4) push into K-consecutive acceptors → print only on accept
-  if (evS1.push(s1Tok)) SLOGF("S steering1: %s\r\n", steerToText(evS1.cur));
-  if (evS2.push(s2Tok)) SLOGF("S steering2: %s\r\n", steerToText(evS2.cur));
-  if (evT1.push(t1Tok)) SLOGF("S throttle1: %s\r\n", t1ToText(evT1.cur));
-  if (evT2.push(t2Tok)) SLOGF("S throttle2: %s\r\n", t2ToText(evT2.cur));
-  if (evG .push(gTok )) SLOGF("S gear: %s\r\n", fnrWord(evG.cur));
+  const uint32_t nowMs = millis();
+
+  if (latchS1.push(s1Tok, nowMs)) SLOGF("S steering: %s\r\n", steerToText(latchS1.cur));
+  if (latchS2.push(s2Tok, nowMs)) SLOGF("S steering rc: %s\r\n", steerToText(latchS2.cur));
+  if (latchT1.push(t1Tok, nowMs)) {
+    if (latchT1.cur==Throttle1DirLv::Off) {
+      SLOGF("S throttle: off\r\n");
+    } else {
+      SLOGF("S throttle: %s\r\n", t1ToText(latchT1.cur));
+    }
+  }
+  if (latchT2.push(t2Tok, nowMs)) SLOGF("S throttle rc: %s\r\n", t2ToText(latchT2.cur));
+  if (latchGear.push(gTok, nowMs)) SLOGF("S gear: %s\r\n", fnrWord(latchGear.cur));
 
   // optional raw watches
   if (g_watch.s1) SLOGF("S S1 raw=%u med=%u\r\n", s1, medS1.get());
