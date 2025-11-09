@@ -181,12 +181,21 @@ namespace {
 
         conLine.trim();
         if (conLine.length()){
+          bool stored=false;
           #if TEENSY_CON_REQUIRE_S
-            if (conLine.startsWith("S ")) conStore(conLine);
+            if (conLine.startsWith("S ")){
+              String trimmed = conLine;
+              trimmed.remove(0,2);
+              conStore(trimmed);
+              stored=true;
+            }
           #else
-            conStore(conLine);
+            String trimmed = conLine;
+            if (trimmed.startsWith("S ")) trimmed.remove(0,2);
+            conStore(trimmed);
+            stored=true;
           #endif
-          uart1_lines++;
+          if (stored) uart1_lines++;
         }
         conLine = "";
       } else {
@@ -198,13 +207,22 @@ namespace {
     // idle flush (if newline never arrives)
     if (conLine.length() && (millis() - lastByteMs) > 250){
       conLine.trim();
+      bool stored=false;
       #if TEENSY_CON_REQUIRE_S
-        if (conLine.startsWith("S ")) conStore(conLine);
+        if (conLine.startsWith("S ")){
+          String trimmed = conLine;
+          trimmed.remove(0,2);
+          conStore(trimmed);
+          stored=true;
+        }
       #else
-        conStore(conLine);
+        String trimmed = conLine;
+        if (trimmed.startsWith("S ")) trimmed.remove(0,2);
+        conStore(trimmed);
+        stored=true;
       #endif
       conLine = "";
-      uart1_lines++;
+      if (stored) uart1_lines++;
     }
   }
 
@@ -443,7 +461,7 @@ namespace {
 
   static String buildTeensyConsolePage() {
     String page;
-    page.reserve(2800);
+    page.reserve(3200);
     page += F(
       "<!doctype html><html><head><meta charset='utf-8'>"
       "<meta name=viewport content='width=device-width,initial-scale=1'>"
@@ -451,12 +469,18 @@ namespace {
       "<style>"
         "body{font-family:system-ui;margin:12px}"
         "#log{background:#0b1220;color:#d7e0f2;padding:12px;border-radius:8px;height:70vh;overflow:auto;font:13px ui-monospace,Consolas,monospace}"
+        ".toolbar{margin:8px 0}"
+        ".toolbar button{padding:6px 12px;border:0;border-radius:6px;background:#1f2937;color:#fff;cursor:pointer}"
+        ".toolbar button:active{transform:translateY(1px)}"
       "</style>"
       "</head><body>"
       "<h3>Teensy Console</h3><p><a href='/'>⬅ Back</a></p>"
+      "<div class='toolbar'><button id='clear-log' type='button'>Clear</button></div>"
       "<div id='log'></div>"
       "<script>"
         "let since=0;const log=document.getElementById('log');"
+        "const clearBtn=document.getElementById('clear-log');"
+        "if(clearBtn){clearBtn.addEventListener('click',()=>{log.innerHTML='';log.scrollTop=0;});}"
         "function addLine(t){if(!t)return;const d=document.createElement('div');d.textContent=t;log.appendChild(d);if(log.childNodes.length>1000)log.removeChild(log.firstChild);log.scrollTop=log.scrollHeight;}"
         "function pull(){fetch('/tail?since='+since).then(r=>r.text()).then(t=>{const n=t.indexOf('\\n');if(n>0){const hdr=t.substring(0,n);if(hdr.startsWith('NEXT '))since=parseInt(hdr.substring(5))||since;const body=t.substring(n+1);body.split('\\n').filter(Boolean).forEach(addLine);}}).catch(()=>{});}"
         "setInterval(pull,300);"
