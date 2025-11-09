@@ -9,6 +9,8 @@
 //
 // If you want USB prints too:  LOG usb   or   LOG both   on the USB serial.
 
+struct TelemetryPayload;
+
 #include <Arduino.h>
 #include <stdarg.h>
 #include <string.h>
