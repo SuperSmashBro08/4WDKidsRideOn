@@ -1,4 +1,6 @@
 #pragma once
+#ifndef ESP32_OTA_HUB_H_INCLUDED
+#define ESP32_OTA_HUB_H_INCLUDED
 // ===== Mad Labs ESP32 OTA Hub (header-only) =====
 // Web UI, Teensy .hex OTA over UART, ESP32 self-OTA .bin,
 // live consoles, persisted last-result, reboot-friendly upload UX,
@@ -1233,3 +1235,5 @@ void loop() {
 }
 
 } // namespace OtaHub
+
+#endif // ESP32_OTA_HUB_H_INCLUDED
