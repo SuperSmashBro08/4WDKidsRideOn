@@ -1,12 +1,21 @@
-// ============ MyApp.ino (V 3.3.1 RAW MIRROR) ============
+// ============ MyApp.ino (V 3.3.6 RAW + Steering Control, single-UART) ============
+//
+// - RAW snapshot line every 10 ms (S1/T1/S2/T2/FNR)
+// - ESP32 angle stream over the SAME UART (Serial2) via OtaUpdater hook
+//   expected line: "AS,<raw>,<deg>"
+// - Motor driver: BTS7960-style on pins 15..18 (LPWM/RPWM/L_EN/R_EN)
+// - 20 kHz PWM for quiet steering drive
+// - OTA + console share Serial2; non-OTA lines are delegated to this sketch via hook
+//
+// If you want USB prints too:  LOG usb   or   LOG both   on the USB serial.
 
 #include <Arduino.h>
-#include "OtaUpdater.h"
-#include "OtaConsole.h"
 #include <stdarg.h>
 #include <string.h>
+#include <math.h>
+#include "OtaUpdater.h"
+#include "OtaConsole.h"
 
-// ---------- Build / board shims ----------
 #ifndef IRAM_ATTR
 #define IRAM_ATTR
 #endif
@@ -15,24 +24,22 @@
 #endif
 
 // ---------- App identity ----------
-#define APP_FW_VERSION   "V 3.3.1-raw"
+#define APP_FW_VERSION   "V 3.3.6"
 
 // ---------- Blink ----------
 #define LED_PIN          13
 #define BLINK_MS         500
 
 // ---------- Raw-mirror mode switch ----------
-// 1 = print ONLY raw snapshot lines on a fixed cadence
-// 0 = (legacy) event/labels printing (disabled by default here)
-#define RAW_MIRROR_MODE  1
+#define RAW_MIRROR_MODE  1   // keep raw stream on
 
 // ---------- IO pins ----------
 static constexpr uint8_t PIN_FWD    = 10;
 static constexpr uint8_t PIN_REV    = 11;
-static constexpr uint8_t PIN_POT_S1 = 14;
-static constexpr uint8_t PIN_POT_T1 = 27;
-static constexpr uint8_t PIN_RC_S   = 4;
-static constexpr uint8_t PIN_RC_T   = 5;
+static constexpr uint8_t PIN_POT_S1 = 14;  // steering analog
+static constexpr uint8_t PIN_POT_T1 = 27;  // throttle analog
+static constexpr uint8_t PIN_RC_S   = 4;   // RC steer PWM in
+static constexpr uint8_t PIN_RC_T   = 5;   // RC throttle PWM in
 
 // ---------- ADC helpers ----------
 static constexpr float ADC_VREF = 3.3f;
@@ -40,7 +47,7 @@ static constexpr int   ADC_MAX  = 4095;
 
 // ---------- Logging sink control ----------
 enum class LogSink : uint8_t { OTA, USB, BOTH };
-static LogSink g_logSink = LogSink::OTA;   // default OTA-only to avoid duplicates
+static LogSink g_logSink = LogSink::OTA;   // OTA-only by default (avoid dupes)
 
 static void LOG_raw(const char* s){
   if (g_logSink==LogSink::OTA || g_logSink==LogSink::BOTH) OtaConsole::printf("%s", s);
@@ -85,7 +92,7 @@ static void IRAM_ATTR isrRcThrottle(){
   else { uint32_t w=now-rcT_rise_us; if(w<=3000){ rcT_width_us=(uint16_t)w; rcT_last_update_us=now; } }
 }
 
-// ===== Maps used for raw line convenience =====
+// ===== Convenience maps =====
 static inline int16_t clamp_i16(int32_t v, int16_t lo, int16_t hi){ if(v<lo) return lo; if(v>hi) return hi; return (int16_t)v; }
 
 static inline int16_t mapRcSteer_us_to_1000(int16_t us){
@@ -111,7 +118,152 @@ static void sampleFnr(){
 
 } // namespace MM
 
-// ===== USB commands (keep simple: LOG sink only) =====
+// ======== ESP32 angle stream over Serial2 via OtaUpdater hook ========
+static volatile uint16_t g_as_raw = 0;
+static volatile float    g_as_deg = NAN;
+static volatile uint32_t g_as_ms  = 0;
+
+extern "C" bool OtaUserHandleLine(const char* line) {
+  // Expect: "AS,<raw>,<deg>" from ESP32
+  if (!line || line[0] != 'A' || line[1] != 'S' || line[2] != ',') return false;
+  const char* p = line + 3;
+  const char* comma = strchr(p, ',');
+  if (!comma) return false;
+
+  uint16_t raw = (uint16_t)strtoul(p, nullptr, 10);
+  float deg = atof(comma + 1);
+
+  noInterrupts();
+  g_as_raw = raw;
+  g_as_deg = deg;
+  g_as_ms  = millis();
+  interrupts();
+  return true;
+}
+static inline bool angleFresh(uint32_t maxAgeMs=200){
+  uint32_t age = millis() - g_as_ms;
+  return (g_as_ms != 0) && (age <= maxAgeMs) && !isnan(g_as_deg);
+}
+
+// ======== Steering controller in a namespace (prevents auto-proto issues) ========
+namespace Steer {
+  // From your calibration
+  static const float STEER_LEFT_DEG   = 129.07f;
+  static const float STEER_RIGHT_DEG  = 201.97f;
+  static const float STEER_CENTER_DEG = (STEER_LEFT_DEG + STEER_RIGHT_DEG) * 0.5f;
+  static const float STEER_TOL_DEG    = 1.5f;
+  static const float KP_PWM_PER_DEG   = 6.0f;
+
+  // Decide target from S1 raw bins (tune quickly from RAW prints)
+  static const uint16_t S1_LEFT_MAX   = 1600;  // S1 ≤ this => Left
+  static const uint16_t S1_RIGHT_MIN  = 2400;  // S1 ≥ this => Right
+
+  // BTS7960 pins
+  static const uint8_t PIN_MOT_LPWM = 15;  // J7-6
+  static const uint8_t PIN_MOT_RPWM = 16;  // J7-5
+  static const uint8_t PIN_MOT_LEN  = 17;  // J7-4
+  static const uint8_t PIN_MOT_REN  = 18;  // J7-3
+
+  static const uint32_t STEER_PWM_FREQ = 20000; // 20 kHz
+  static const int      PWM_MAX         = 255;   // 8-bit
+  static const int      PWM_MIN         = 60;
+
+  enum class Target : uint8_t { Left, Center, Right };
+  enum class State  : uint8_t { Idle, ToLeft, ToCenter, ToRight, Holding, NoAngle };
+
+  static State  g_ss      = State::Idle;
+  static Target g_lastTgt = Target::Center;
+
+  static inline Target pickTarget(uint16_t s1raw){
+    if (s1raw <= S1_LEFT_MAX)  return Target::Left;
+    if (s1raw >= S1_RIGHT_MIN) return Target::Right;
+    return Target::Center;
+  }
+  static inline float targetDegFor(Target t){
+    switch (t){ case Target::Left:  return STEER_LEFT_DEG;
+               case Target::Right: return STEER_RIGHT_DEG;
+               default:            return STEER_CENTER_DEG; }
+  }
+
+  static void setMotor(int pwmSigned){
+    int mag = pwmSigned;
+    if (mag < 0) mag = -mag;
+    if (mag > 0 && mag < PWM_MIN) mag = PWM_MIN;
+    if (mag > PWM_MAX) mag = PWM_MAX;
+
+    if (pwmSigned > 0){
+      // drive RIGHT
+      digitalWrite(PIN_MOT_LEN, LOW);
+      digitalWrite(PIN_MOT_REN, HIGH);
+      analogWrite(PIN_MOT_LPWM, 0);
+      analogWrite(PIN_MOT_RPWM, mag);
+    } else if (pwmSigned < 0){
+      // drive LEFT
+      digitalWrite(PIN_MOT_REN, LOW);
+      digitalWrite(PIN_MOT_LEN, HIGH);
+      analogWrite(PIN_MOT_RPWM, 0);
+      analogWrite(PIN_MOT_LPWM, mag);
+    } else {
+      // stop
+      analogWrite(PIN_MOT_LPWM, 0);
+      analogWrite(PIN_MOT_RPWM, 0);
+      digitalWrite(PIN_MOT_LEN, LOW);
+      digitalWrite(PIN_MOT_REN, LOW);
+    }
+  }
+
+  static void enter(State s, const char* note){
+    g_ss = s;
+    SLOGF("E STEER %s\n", note);
+  }
+
+  static void begin(){
+    pinMode(PIN_MOT_LPWM, OUTPUT);
+    pinMode(PIN_MOT_RPWM, OUTPUT);
+    pinMode(PIN_MOT_LEN,  OUTPUT);
+    pinMode(PIN_MOT_REN,  OUTPUT);
+    analogWriteFrequency(PIN_MOT_LPWM, STEER_PWM_FREQ);
+    analogWriteFrequency(PIN_MOT_RPWM, STEER_PWM_FREQ);
+    analogWriteResolution(8);
+    setMotor(0);
+  }
+
+  static void tick(uint16_t s1raw){
+    Target tgt = pickTarget(s1raw);
+    float  tgtDeg = targetDegFor(tgt);
+
+    if (!::angleFresh()){
+      setMotor(0);
+      if (g_ss != State::NoAngle) enter(State::NoAngle, "no-angle");
+      g_lastTgt = tgt;
+      return;
+    }
+
+    float cur = ::g_as_deg;
+    float err = tgtDeg - cur;                      // +err => need to move RIGHT
+    int   pwm = (int)(KP_PWM_PER_DEG * err);
+
+    if (fabsf(err) <= STEER_TOL_DEG){
+      setMotor(0);
+      if (g_ss != State::Holding || tgt != g_lastTgt){
+        const char* where = (tgt==Target::Left)?"left":(tgt==Target::Right)?"right":"center";
+        enter(State::Holding, where);
+      }
+    } else {
+      setMotor(pwm);
+      State want = (tgt==Target::Left)? State::ToLeft :
+                   (tgt==Target::Right)? State::ToRight : State::ToCenter;
+      if (g_ss != want || tgt != g_lastTgt){
+        const char* where = (tgt==Target::Left)?"left":(tgt==Target::Right)?"right":"center";
+        enter(want, where);
+      }
+    }
+
+    g_lastTgt = tgt;
+  }
+} // namespace Steer
+
+// ===== USB commands (simple: LOG sink only) =====
 static void handleUsbCommandsOnce() {
   static String line;
   while (Serial.available()){
@@ -157,7 +309,7 @@ void setup(){
   Serial.begin(115200);
   Serial2.begin(115200);
 
-  // Bring up OTA bridge on Serial2; delay console until loader quiet
+  // Bring up OTA on Serial2 (used also for console & app hook)
   OtaUpdater::begin(Serial2);
   OtaUpdater::setAppVersion(APP_FW_VERSION);
 
@@ -166,8 +318,11 @@ void setup(){
   OtaConsole::begin(Serial2);  // logs to ESP32 (/console)
   OtaConsole::setEnabled(true);
 
-  // Boot banner (prefixed "S " by OtaConsole)
-  SLOGF("MyApp RAW mirror FW=%s  (blink=%d ms)\r\n", APP_FW_VERSION, BLINK_MS);
+  // Motor driver init
+  Steer::begin();
+
+  // Boot banner
+  SLOGF("MyApp RAW+STEER FW=%s  (blink=%d ms)\r\n", APP_FW_VERSION, BLINK_MS);
   SLOGF("BOOT_PINS fwd=%d rev=%d (0=LOW,1=HIGH)\r\n",
         (int)digitalRead(PIN_FWD), (int)digitalRead(PIN_REV));
 }
@@ -175,11 +330,10 @@ void setup(){
 void loop(){
   using namespace MM;
 
-  // OTA tick & mute console during active OTA
+  // OTA tick (console will be force-muted by the OTA module on HELLO)
   OtaUpdater::tick();
-  OtaConsole::setEnabled(!OtaUpdater::inProgress());
 
-  // 100 Hz sampling tick
+  // 100 Hz sampling tick (RAW stream)
   static uint32_t t_sample=0;
   if (micros() - t_sample >= 10000){ // 10ms
     t_sample = micros();
@@ -192,33 +346,29 @@ void loop(){
     sampleFnr();
 
 #if RAW_MIRROR_MODE
-    // --- RAW snapshot line every tick (no dedup, no states) ---
     const int16_t s2_map = mapRcSteer_us_to_1000(g_s2_us);
     const int16_t t2_map = mapRcThr_us_to_1000(g_t2_us);
-
-    // One concise line, parseable & human readable.
-    // NOTE: OtaConsole prefixes "S " and appends CRLF.
     SLOGF("RAW S1=%u  T1=%u  S2_us=%d(%d)  T2_us=%d(%d)  FNR=%s\r\n",
           (unsigned)g_s1,
           (unsigned)g_t1,
           (int)g_s2_us, (int)s2_map,
           (int)g_t2_us, (int)t2_map,
           fnrWord(g_fnr));
-#else
-    // (Legacy path disabled in this RAW build)
-    // tickEventPipeline(); // prints on-change with labels
-    // Desired des; computeDesired(des); applyOutputs(des);
 #endif
   }
 
-  // Blink (paused during OTA by console mute only)
+  // ~50 Hz steering control loop
+  static uint32_t t_ctrl = 0;
+  if (micros() - t_ctrl >= 20000){
+    t_ctrl = micros();
+    Steer::tick(MM::g_s1);
+  }
+
+  // Blink
   static uint32_t t_led=0; static bool led=false;
-  if (!OtaUpdater::inProgress() && millis() - t_led >= BLINK_MS){
+  if (millis() - t_led >= BLINK_MS){
     t_led = millis(); led = !led; digitalWrite(LED_PIN, led? HIGH:LOW);
   }
 
   handleUsbCommandsOnce();
-
-  // Optional: mirror USB input to ESP32 console as lines (commented by default)
-  // OtaConsole::mirrorUsbStreamOnce();
 }
