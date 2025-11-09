@@ -143,91 +143,110 @@ namespace {
 
   enum class TelemetryState : uint8_t { WaitMagic0, WaitMagic1, WaitVersion, WaitLength, ReadPayload, SkipPayload };
 
-  struct TelemetryParser {
+  struct TelemetryStreamParser {
     TelemetryState state = TelemetryState::WaitMagic0;
     uint8_t        curVersion = 0;
     uint8_t        curLength  = 0;
     uint8_t        payload[TELEM_MAX_PAYLOAD] = {};
     uint8_t        pos = 0;
     uint8_t        skip = 0;
-  };
 
-  static TelemetryParser telemParser;
-
-  static inline void telemetryResetParser(){ telemParser = TelemetryParser{}; }
-
-  static bool telemetryConsumeByte(uint8_t b){
-    TelemetryParser& p = telemParser;
-
-    switch (p.state){
-      case TelemetryState::WaitMagic0:
-        if (b == TELEM_MAGIC0){
-          p.state = TelemetryState::WaitMagic1;
-          return true;
-        }
-        return false;
-
-      case TelemetryState::WaitMagic1:
-        if (b == TELEM_MAGIC1){
-          p.state = TelemetryState::WaitVersion;
-          return true;
-        }
-        p.state = TelemetryState::WaitMagic0;
-        return false;
-
-      case TelemetryState::WaitVersion:
-        p.curVersion = b;
-        p.state = TelemetryState::WaitLength;
-        return true;
-
-      case TelemetryState::WaitLength:
-        p.curLength = b;
-        if (p.curLength == 0){
-          p.state = TelemetryState::WaitMagic0;
-          return true;
-        }
-        if (p.curLength > TELEM_MAX_PAYLOAD){
-          p.skip = p.curLength;
-          p.state = TelemetryState::SkipPayload;
-          return true;
-        }
-        p.pos = 0;
-        p.state = TelemetryState::ReadPayload;
-        return true;
-
-      case TelemetryState::ReadPayload:
-        p.payload[p.pos++] = b;
-        if (p.pos >= p.curLength){
-          if (p.curVersion == TELEM_VERSION && p.curLength == sizeof(TelemetryPayload)){
-            memcpy(&latestTelem.payload, p.payload, sizeof(TelemetryPayload));
-            latestTelem.magic0 = TELEM_MAGIC0;
-            latestTelem.magic1 = TELEM_MAGIC1;
-            latestTelem.version = p.curVersion;
-            latestTelem.length  = p.curLength;
-            telemetryValid      = true;
-            telemetryUpdatedMs  = millis();
-            uint16_t seq        = latestTelem.payload.seq;
-            if (telemetryHasSeq){
-              uint16_t delta = (uint16_t)(seq - telemetryLastSeq);
-              if (delta > 1) telemetryDropCount += (uint32_t)(delta - 1);
-            }
-            telemetryLastSeq = seq;
-            telemetryHasSeq  = true;
-          }
-          p.state = TelemetryState::WaitMagic0;
-        }
-        return true;
-
-      case TelemetryState::SkipPayload:
-        if (p.skip){
-          --p.skip;
-          if (!p.skip) p.state = TelemetryState::WaitMagic0;
-        }
-        return true;
+    void reset(){
+      state = TelemetryState::WaitMagic0;
+      curVersion = 0;
+      curLength = 0;
+      pos = 0;
+      skip = 0;
+      memset(payload, 0, sizeof(payload));
     }
 
-    p.state = TelemetryState::WaitMagic0;
-    return false;
+    bool consume(uint8_t b){
+      switch (state){
+        case TelemetryState::WaitMagic0:
+          if (b == TELEM_MAGIC0){
+            state = TelemetryState::WaitMagic1;
+            return true;
+          }
+          return false;
+
+        case TelemetryState::WaitMagic1:
+          if (b == TELEM_MAGIC1){
+            state = TelemetryState::WaitVersion;
+            return true;
+          }
+          state = TelemetryState::WaitMagic0;
+          return false;
+
+        case TelemetryState::WaitVersion:
+          curVersion = b;
+          state = TelemetryState::WaitLength;
+          return true;
+
+        case TelemetryState::WaitLength:
+          curLength = b;
+          if (curLength == 0){
+            state = TelemetryState::WaitMagic0;
+            return true;
+          }
+          if (curLength > TELEM_MAX_PAYLOAD){
+            skip = curLength;
+            state = TelemetryState::SkipPayload;
+            return true;
+          }
+          pos = 0;
+          state = TelemetryState::ReadPayload;
+          return true;
+
+        case TelemetryState::ReadPayload:
+          payload[pos++] = b;
+          if (pos >= curLength){
+            if (curVersion == TELEM_VERSION && curLength == sizeof(TelemetryPayload)){
+              memcpy(&latestTelem.payload, payload, sizeof(TelemetryPayload));
+              latestTelem.magic0 = TELEM_MAGIC0;
+              latestTelem.magic1 = TELEM_MAGIC1;
+              latestTelem.version = curVersion;
+              latestTelem.length  = curLength;
+              telemetryValid      = true;
+              telemetryUpdatedMs  = millis();
+              uint16_t seq        = latestTelem.payload.seq;
+              if (telemetryHasSeq){
+                uint16_t delta = (uint16_t)(seq - telemetryLastSeq);
+                if (delta > 1) telemetryDropCount += (uint32_t)(delta - 1);
+              }
+              telemetryLastSeq = seq;
+              telemetryHasSeq  = true;
+            }
+            state = TelemetryState::WaitMagic0;
+          }
+          return true;
+
+        case TelemetryState::SkipPayload:
+          if (skip){
+            --skip;
+            if (!skip) state = TelemetryState::WaitMagic0;
+          }
+          return true;
+      }
+
+      state = TelemetryState::WaitMagic0;
+      return false;
+    }
+  };
+
+  static TelemetryStreamParser telemetryParser;
+
+  static inline void telemetryResetParser(){
+    telemetryParser.reset();
+    telemetryValid = false;
+    telemetryHasSeq = false;
+    telemetryLastSeq = 0;
+    telemetryDropCount = 0;
+    telemetryUpdatedMs = 0;
+    memset(&latestTelem, 0, sizeof(latestTelem));
+  }
+
+  static bool telemetryConsumeByte(uint8_t b){
+    return telemetryParser.consume(b);
   }
 
   static void drainTeensyInput(){
