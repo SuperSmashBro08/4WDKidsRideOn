@@ -1,510 +1,191 @@
-#include <WiFi.h>
-#include <WebServer.h>
-#include <LittleFS.h>
-#include <ESPmDNS.h>
-#include "secrets.h"   // #define WIFI_SSID "...", WIFI_PASS "...", OTA_TOKEN "..."
+// ===== App identity =====
+#define APP_NAME "ESP32_Uploader"
+#define APP_VER  "v1.3.0"   // bump as you like
 
+// ===== Teensy UART pins (unchanged) =====
 #define TEENSY_TX 43
 #define TEENSY_RX 44
-HardwareSerial SerialTeensy(1);
 
-WebServer server(80);
+// ===== Angle sensor wiring =====
+// AS5600 on I2C  (SDA = 8, SCL = 9)
+// Module's analog/PWM OUT -> GPIO 5  (optional)
+#define I2C_SDA_PIN      8
+#define I2C_SCL_PIN      9
+#define ANGLE_ANALOG_PIN 5
 
-// ---------- State for UI ----------
-static String lastOtaLog;
-static bool   lastOtaSuccess = false;
-static unsigned long lastOtaMillis = 0;
+// ===== App print options =====
+#define PRINT_OUT5_VOLTS   0   // 0 = hide analog voltage column, 1 = show it
+#define PRINT_PERIOD_MS  100   // print every 100ms
 
-// ---------- Live console ring buffer (keep exact "S ..." lines) ----------
-static const uint16_t CON_CAP = 500;        // ~500 recent lines
-static String         conBuf[CON_CAP];
-static uint32_t       conId    = 0;         // id of most recently stored line
-static String         conLine;              // UART line assembler
+// ===== Quiet window after steer direction change =====
+// We skip fresh I2C reads for this period and reuse last-good value.
+#define QUIET_MS          180  // try 120..250 as needed
 
-static inline void conStore(const String& s) {
-  ++conId; conBuf[conId % CON_CAP] = s;
-}
+#include <Arduino.h>
+#include <Wire.h>
+#include "esp_log.h"            // for esp_log_level_set(...)
+#include "secrets.h"            // #define WIFI_SSID "...", WIFI_PASS "...", OTA_TOKEN "..."
+#include "esp32_ota_hub.h"      // your OTA hub header
 
-// ---------- Small helpers ----------
-static String htmlEscape(const String& in) {
-  String out; out.reserve(in.length() + 16);
-  for (size_t i=0;i<in.length();++i) {
-    char c = in[i];
-    if (c=='&') out += F("&amp;");
-    else if (c=='<') out += F("&lt;");
-    else if (c=='>') out += F("&gt;");
-    else out += c;
+// ---- Web console logging shortcuts (mirror to USB + /esp32-console)
+#define LOG(s)        OtaHub::ELOG(s)
+#define LOGF(...)     OtaHub::ELOGF(__VA_ARGS__)
+
+// ===== AS5600 registers / address =====
+static const uint8_t  AS5600_ADDR     = 0x36;
+static const uint8_t  REG_RAW_ANGLE   = 0x0C;   // 12-bit (0..4095)
+static const uint8_t  REG_ANGLE       = 0x0E;   // scaled (also 12-bit)
+static const uint32_t I2C_CLK_HZ      = 400000; // 400 kHz
+static const uint8_t  I2C_RETRIES     = 3;      // retries per read
+static const uint32_t I2C_XFER_TO_MS  = 40;     // per transfer timeout
+
+// ===== Helpers =====
+static inline float ticksToDeg(uint16_t t12) { return (360.0f * (float)t12) / 4096.0f; }
+static inline int   wrapDist(int a, int b) { int d=b-a; while(d<-2048) d+=4096; while(d>=2048) d-=4096; return d; }
+
+// Simple EMA (no templates to avoid past compile errors)
+struct EMA {
+  float y;
+  float alpha;  // 0..1 (higher = snappier)
+  EMA(float a=0.20f): y(NAN), alpha(a) {}
+  float update(float x) {
+    if (isnan(y)) y = x;
+    else y = y + alpha * (x - y);
+    return y;
   }
-  return out;
-}
+};
 
-static String buildIndexPage() {
-  String page;
-  page.reserve(2800);
-  page += F(
-  "<!doctype html><html><head><meta charset='utf-8'>"
-  "<meta name=viewport content='width=device-width,initial-scale=1'>"
-  "<title>ESP32 → Teensy OTA</title>"
-  "<style>"
-    "body{font-family:system-ui;margin:24px;max-width:760px}"
-    "pre{background:#f6f8fa;padding:12px;border-radius:8px;overflow:auto}"
-    "code{background:#f6f8fa;padding:2px 6px;border-radius:4px}"
-    "#bar{width:100%;height:12px;background:#eee;border-radius:6px;overflow:hidden;margin:8px 0 4px 0;display:none}"
-    "#fill{height:100%;width:0%}"
-    ".ok{background:#2ecc71}.bad{background:#e74c3c}.info{background:#3498db}"
-    "button{padding:8px 14px;border:0;border-radius:8px;background:#111;color:#fff;cursor:pointer}"
-    "button[disabled]{opacity:.6;cursor:not-allowed}"
-    "#status{min-height:1.2em}"
-    "a.btn{display:inline-block;padding:8px 12px;border-radius:8px;background:#0b5; color:#fff; text-decoration:none}"
-  "</style>"
-  "</head><body><h2>ESP32 → Teensy OTA</h2>"
-  "<form id='f' method='POST' action='/upload' enctype='multipart/form-data'>"
-  "<p><b>Upload Teensy firmware</b> (<code>.hex</code> from <i>Export compiled Binary</i>)</p>"
-  "<input id='file' type='file' name='firmware' accept='.hex' required>"
-  "<p><button id='go' type='submit'>Upload & Flash</button> "
-  "<a class='btn' href='/console'>Open Live Console</a></p>"
-  "<div id='bar'><div id='fill' class='info'></div></div>"
-  "<div id='status'></div>"
-  "</form>"
-  "<hr>"
-  "<p>"
-    "<button onclick=\"fetch('/ping').then(r=>r.text()).then(t=>alert(t)).catch(()=>alert('ping failed'))\">Ping Teensy</button> "
-    "<button onclick=\"fetch('/version').then(r=>r.text()).then(t=>alert(t)).catch(()=>alert('version failed'))\">Get Version</button>"
-  "</p>"
-  );
+// ===== Steer flip quieting =====
+// Call markSteerFlip() from your code at the instant you flip steer direction.
+// (If you don't call it, we simply never enter the quiet window.)
+static volatile uint32_t gSteerFlipMs = 0;
+static inline void markSteerFlip() { gSteerFlipMs = millis(); }  // expose for your use
 
-  if (lastOtaLog.length()) {
-    page += lastOtaSuccess ? F("<h3 style='color:#0a0'>Last OTA: success</h3>")
-                           : F("<h3 style='color:#b00'>Last OTA: failed</h3>");
-    if (lastOtaMillis) {
-      page += F("<p><small>Completed ");
-      page += String((millis() - lastOtaMillis) / 1000);
-      page += F(" s ago</small></p>");
+// ===== I2C read with retry (16-bit big-endian register) =====
+static bool i2c_read16_retry(uint8_t addr, uint8_t reg, uint16_t& out) {
+  for (uint8_t attempt = 0; attempt < I2C_RETRIES; ++attempt) {
+    Wire.beginTransmission(addr);
+    Wire.write(reg);
+    // 'false' => repeated start
+    if (Wire.endTransmission(false) != 0) { delay(1); continue; }
+
+    int n = Wire.requestFrom((int)addr, 2, (int)true); // stop=true
+    if (n == 2) {
+      uint8_t hi = Wire.read();
+      uint8_t lo = Wire.read();
+      out = (uint16_t)((hi << 8) | lo);
+      return true;
     }
-    page += F("<pre>");
-    page += htmlEscape(lastOtaLog);
-    page += F("</pre>");
+    delay(1);
   }
-
-  page += F(
-  "<script>"
-  "const f=document.getElementById('f');"
-  "const btn=document.getElementById('go');"
-  "const file=document.getElementById('file');"
-  "const bar=document.getElementById('bar');"
-  "const fill=document.getElementById('fill');"
-  "const status=document.getElementById('status');"
-  "function finalizeUI(ok){"
-    "fill.className = ok ? 'ok' : 'bad';"
-    "status.textContent = ok ? 'Flashing complete. Returning to home…' : 'Upload failed.';"
-    "setTimeout(()=>{ window.location='/'; }, 900);"
-  "}"
-  "async function checkLastAndFinalize(){"
-    "try{"
-      "const r = await fetch('/last',{cache:'no-store'});"
-      "const t = await r.text();"
-      "finalizeUI(t.trim()==='OK');"
-    "}catch(e){"
-      "finalizeUI(false);"
-    "}"
-  "}"
-  "f.addEventListener('submit',e=>{"
-    "e.preventDefault();"
-    "if(!file.files.length){alert('Choose a .hex first');return;}"
-    "btn.disabled=true;"
-    "status.textContent='Uploading…';"
-    "bar.style.display='block';"
-    "fill.style.width='0%';"
-    "fill.className='info';"
-    "const xhr=new XMLHttpRequest();"
-    "xhr.open('POST','/upload');"
-    "xhr.timeout = 120000;"
-    "xhr.upload.onprogress=(ev)=>{"
-      "if(ev.lengthComputable){"
-        "const pct=Math.round((ev.loaded/ev.total)*100);"
-        "fill.style.width=pct+'%';"
-      "}else{fill.style.width='100%';}"
-    "};"
-    "xhr.onload=()=>{ checkLastAndFinalize(); };"
-    "xhr.onerror=()=>{ checkLastAndFinalize(); };"
-    "xhr.ontimeout=()=>{ checkLastAndFinalize(); };"
-    "const fd=new FormData(f);"
-    "xhr.send(fd);"
-  "});"
-  "</script>"
-  "</body></html>");
-  return page;
+  return false;
 }
 
-// ---------- console UI ----------
-static String buildConsolePage() {
-  String page;
-  page.reserve(2800);
-  page += F(
-    "<!doctype html><html><head><meta charset='utf-8'>"
-    "<meta name=viewport content='width=device-width,initial-scale=1'>"
-    "<title>Teensy Console</title>"
-    "<style>"
-      "body{font-family:system-ui;margin:12px}"
-      "#toolbar{margin-bottom:8px}"
-      "#log{background:#0b1220;color:#d7e0f2;padding:12px;border-radius:8px;"
-           "min-height:70vh;height:70vh;overflow:auto;"
-           "font:13px ui-monospace,Consolas,monospace}"
-      ".line{white-space:pre-wrap;margin:0}"
-      "button{padding:6px 10px;border:0;border-radius:8px;background:#333;color:#fff;margin-right:6px}"
-      "button[disabled]{opacity:.6;cursor:not-allowed}"
-      "a{color:#6cf;text-decoration:none}"
-    "</style>"
-    "</head><body>"
-    "<h3>Teensy Console</h3>"
-    "<p><a href='/'>⬅ Back</a></p>"
-    "<div id='toolbar'>"
-      "<button id='pause'>Pause</button>"
-      "<button id='resume' disabled>Resume</button>"
-      "<button id='clear'>Clear</button>"
-    "</div>"
-    "<div id='log'></div>"
-    "<script>"
-      "let since=0, paused=false;"
-      "const log=document.getElementById('log');"
-      "const MAX_NODES=1200;"
-      "const btnPause=document.getElementById('pause');"
-      "const btnResume=document.getElementById('resume');"
-      "const btnClear=document.getElementById('clear');"
-
-      "btnPause.onclick=()=>{ paused=true; btnPause.disabled=true; btnResume.disabled=false; };"
-      "btnResume.onclick=()=>{ paused=false; btnPause.disabled=false; btnResume.disabled=true; };"
-      "btnClear.onclick=()=>{ log.innerHTML=''; };"
-
-      "let autoScroll=true;"
-      "log.addEventListener('scroll', ()=>{"
-        "autoScroll = (log.scrollTop + log.clientHeight >= log.scrollHeight - 4);"
-      "});"
-
-      "function addLine(text){"
-        "if(!text || paused) return;"
-        "const wasAuto = autoScroll;"
-        "const div=document.createElement('div');"
-        "div.className='line';"
-        "div.textContent=text;"
-        "log.appendChild(div);"
-        "while(log.childNodes.length>MAX_NODES){ log.removeChild(log.firstChild); }"
-        "if(wasAuto){ log.scrollTop = log.scrollHeight; }"
-      "}"
-
-      "function pull(){"
-        "fetch('/tail?since='+since,{cache:'no-store'})"
-        ".then(r=>r.text()).then(t=>{"
-          "const nl=t.indexOf('\\n');"
-          "if(nl>0){"
-            "const hdr=t.substring(0,nl);"
-            "if(hdr.startsWith('NEXT ')){ since=parseInt(hdr.substring(5))||since; }"
-            "const body=t.substring(nl+1);"
-            "const lines=body.split('\\n').filter(Boolean);"
-            "for(let i=0;i<lines.length;i++){ addLine(lines[i]); }"
-          "}"
-        "}).catch(()=>{});"
-      "}"
-      "setInterval(pull, 300);"
-    "</script>"
-    "</body></html>"
-  );
-  return page;
-}
-
-// ---------- helpers ----------
-static void ensureLittleFS() {
-  if (!LittleFS.begin(true)) Serial.println("[FS] LittleFS mount failed");
-  else                       Serial.println("[FS] LittleFS mounted");
-}
-
-static void connectWifi() {
-  Serial.println("\n[WiFi] Connecting...");
-  WiFi.mode(WIFI_STA);
-  WiFi.setHostname("esp32-teensy");
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  unsigned long t0 = millis();
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(250); Serial.print('.');
-    if (millis() - t0 > 25000) { Serial.println("\n[WiFi] Failed. Rebooting."); delay(500); ESP.restart(); }
-  }
-  Serial.printf("\n[WiFi] Connected. IP: %s\n", WiFi.localIP().toString().c_str());
-  if (MDNS.begin("esp32-teensy")) { MDNS.addService("http","tcp",80); Serial.println("[mDNS] esp32-teensy.local ready"); }
-  else Serial.println("[mDNS] start failed");
-}
-
-// Read a line from Teensy (CRLF tolerant)
-static bool readLineFrom(Stream& s, String& out, uint32_t to_ms=3000) {
-  out = ""; unsigned long t0 = millis();
-  while (millis()-t0 < to_ms) {
-    while (s.available()) {
-      char c = (char)s.read();
-      if (c=='\r') continue;
-      if (c=='\n') { out.trim(); return true; }
-      if (out.length() < 400) out += c;
-    }
-    delay(1); yield();
-  }
-  out.trim();
-  return out.length() > 0;
-}
-
-// Pump Teensy UART into ring buffer; store only exact lines that start with "S "
-static void pumpTeensyConsole() {
-  while (SerialTeensy.available()) {
-    char c = (char)SerialTeensy.read();
-    if (c == '\r') continue;
-    if (c == '\n') {
-      conLine.trim();
-      if (conLine.length() >= 2 && conLine[0] == 'S' && conLine[1] == ' ') {
-        // Store the full line as-is (keep leading "S ")
-        conStore(conLine);
-      }
-      conLine = "";
-    } else {
-      if (conLine.length() < 512) conLine += c;
-    }
-  }
-}
-
-// ---------- flashing helpers (unchanged, omitted comments for brevity) ----------
-static bool validateHexFile(File& f, String& err) {
-  if (!f) { err="open failed"; return false; }
-  if (!f.size()) { err="empty file"; return false; }
-  size_t pos = f.position();
-  String first = f.readStringUntil('\n'); first.trim();
-  while (first.length()==0 && f.available()) { first = f.readStringUntil('\n'); first.trim(); }
-  if (first.length()==0 || first[0] != ':') { err="not Intel HEX (no leading colon)"; f.seek(pos); return false; }
-  f.seek(0);
-  String line, lastNonEmpty;
-  while (f.available()) { line = f.readStringUntil('\n'); line.trim(); if (line.length()) lastNonEmpty = line; }
-  f.seek(0);
-  if (lastNonEmpty != ":00000001FF") { err = "missing EOF (:00000001FF)"; return false; }
+static bool as5600_read_raw(uint16_t& raw12) {
+  uint16_t v;
+  if (!i2c_read16_retry(AS5600_ADDR, REG_RAW_ANGLE, v)) return false;
+  raw12 = (uint16_t)(v & 0x0FFF);
   return true;
 }
 
-static bool expectStartsWith(Stream& s, const char* prefix, String* captured=nullptr, uint32_t to_ms=3000) {
-  String line; if (!readLineFrom(s, line, to_ms)) return false;
-  Serial.print("<- "); Serial.println(line);
-  if (captured) *captured = line;
-  return line.startsWith(prefix);
-}
+// ===== Runtime state =====
+static EMA   emaDeg(0.20f);     // smoothed degrees
+#if PRINT_OUT5_VOLTS
+static EMA   emaVolts(0.20f);   // smoothed analog volts
+#endif
+static uint16_t lastGoodRaw = 0;
+static bool     haveGood    = false;
+static unsigned long lastPrint = 0;
 
-static bool flashTeensyFromFS(const char* path, String& logOut) {
-  File f = LittleFS.open(path, FILE_READ);
-  String vErr;
-  if (!validateHexFile(f, vErr)) { logOut += "HEX validate error: " + vErr + "\n"; f.close(); return false; }
-
-  const size_t totalBytes = f.size();
-  size_t sentBytes = 0;
-  auto logProgress = [&](size_t extra){ sentBytes += extra; if (totalBytes) {
-      int pct = (int)( (100ULL * sentBytes) / totalBytes );
-      logOut += "PROGRESS " + String(pct) + "% (" + String(sentBytes) + "/" + String(totalBytes) + ")\n";
-    }};
-
-  while (SerialTeensy.available()) SerialTeensy.read();
-
-  SerialTeensy.printf("HELLO %s\r\n", OTA_TOKEN);
-  logOut += "Sent HELLO\n";
-
-  String resp;
-  bool helloOk = false;
-  uint8_t attempts = 0;
-  unsigned long t_deadline = millis() + 4000;
-
-  while (millis() < t_deadline && attempts < 3) {
-    if (!readLineFrom(SerialTeensy, resp, 800)) {
-      attempts++;
-      SerialTeensy.printf("HELLO %s\r\n", OTA_TOKEN);
-      logOut += "HELLO timeout, retrying...\n";
-      continue;
-    }
-    logOut += "<- " + resp + "\n";
-    if (resp == "READY") { helloOk = true; break; }
-    if (resp == "BUSY")  { delay(250); continue; }
-    if (resp == "NACK")  { logOut += "Token mismatch (NACK)\n"; break; }
-    if (resp.startsWith("S ") || resp.startsWith("FW ") || resp.startsWith("FLASHERX ")) continue;
-    if (resp == "ERR") { attempts++; SerialTeensy.printf("HELLO %s\r\n", OTA_TOKEN);
-      logOut += "HELLO got ERR, retrying...\n"; continue; }
-    logOut += "Unexpected during HELLO: " + resp + "\n";
-  }
-  if (!helloOk) { f.close(); return false; }
-
-  SerialTeensy.print("BEGIN HEX\r\n");
-  if (!expectStartsWith(SerialTeensy, "HEX BEGIN", &resp, 1500)) {
-    logOut += "No HEX BEGIN (got: " + resp + ")\n"; f.close(); return false;
-  }
-  logOut += "<- " + resp + "\n";
-
-  f.seek(0);
-  size_t lineNumber = 0, ok=0, bad=0;
-  const uint16_t lineDelayUs = 200;
-  while (f.available()) {
-    String rec = f.readStringUntil('\n'); rec.trim();
-    if (!rec.length()) continue;
-    lineNumber++;
-
-    SerialTeensy.print("L "); SerialTeensy.print(rec); SerialTeensy.print("\r\n");
-
-    String ack;
-    if (!readLineFrom(SerialTeensy, ack, 1500)) { logOut += "Line " + String(lineNumber) + " timeout\n"; bad++; break; }
-    logOut += "<- " + ack + "\n";
-
-    if (ack.startsWith("OK ")) {
-      uint32_t n = ack.substring(3).toInt();
-      if (n != lineNumber) logOut += "WARN: OK index mismatch (got " + String(n) + ")\n";
-      ok++;
-    } else if (ack.startsWith("BAD ")) {
-      bad++; logOut += "Teensy reported BAD at line " + String(lineNumber) + "\n"; break;
-    } else { bad++; logOut += "Unexpected reply at line " + String(lineNumber) + ": " + ack + "\n"; break; }
-
-    logProgress(rec.length()+3);
-    delayMicroseconds(lineDelayUs);
-    yield();
-  }
-  f.close();
-
-  SerialTeensy.print("END\r\n");
-  logOut += "Sent lines: " + String(lineNumber) + " (OK=" + String(ok) + " BAD=" + String(bad) + ")\n";
-
-  bool success = false;
-  unsigned long t0 = millis();
-  while (millis()-t0 < 6000) {
-    String summary;
-    if (!readLineFrom(SerialTeensy, summary, 500)) { yield(); continue; }
-    logOut += summary + "\n";
-    if (summary.startsWith("HEX OK")) success = true;
-    if (summary=="APPLIED" || summary.startsWith("HEX ERR")) break;
-  }
-  return success && (bad==0);
-}
-
-// ---------- HTTP handlers ----------
-static void handleRoot() { server.send(200, "text/html", buildIndexPage()); }
-
-static void handlePing() {
-  while (SerialTeensy.available()) SerialTeensy.read();
-  SerialTeensy.print("PING\r\n");
-  String resp;
-  if (readLineFrom(SerialTeensy, resp, 800)) server.send(200, "text/plain", resp);
-  else server.send(504, "text/plain", "timeout");
-}
-
-static void handleVersion() {
-  while (SerialTeensy.available()) SerialTeensy.read();
-  SerialTeensy.print("VERSION\r\n");
-  String a,b; String out;
-  if (readLineFrom(SerialTeensy, a, 800)) out += a + "\n";
-  if (readLineFrom(SerialTeensy, b, 200)) out += b + "\n";
-  server.send(out.length()?200:504, "text/plain", out.length()?out:"timeout");
-}
-
-static void handleLast() { server.send(200, "text/plain", lastOtaSuccess ? "OK" : "ERR"); }
-
-static void handleConsolePage() { server.send(200, "text/html", buildConsolePage()); }
-
-// Tail endpoint polled by the console
-static void handleTail() {
-  uint32_t since = 0;
-  if (server.hasArg("since")) since = (uint32_t) strtoul(server.arg("since").c_str(), nullptr, 10);
-
-  const uint16_t MAX_LINES = 200;
-  uint32_t curId = conId;
-
-  if (since >= curId) {
-    server.send(200, "text/plain", "NEXT " + String(curId) + "\n");
-    return;
-  }
-
-  uint32_t start = since + 1;
-  if (start + MAX_LINES < curId) start = curId - MAX_LINES;
-
-  String out; out.reserve(4096);
-  out += "NEXT "; out += String(curId); out += "\n";
-
-  for (uint32_t id = start; id <= curId; ++id) {
-    if ((curId - id) >= CON_CAP) continue; // fell out of ring
-    const String& line = conBuf[id % CON_CAP];
-    if (line.length()) {
-      out += line; out += "\n";
-      if (out.length() > 60000) break;
-    }
-  }
-  server.send(200, "text/plain", out);
-}
-
-static File uploadFile;
-static bool uploadedWasHex = false;
-static String uploadName;
-
-static void handleUpload() {
-  HTTPUpload& up = server.upload();
-
-  if (up.status == UPLOAD_FILE_START) {
-    uploadName = up.filename;
-    uploadedWasHex = uploadName.endsWith(".hex") || uploadName.endsWith(".HEX");
-    Serial.printf("[HTTP] Upload start: %s\n", uploadName.c_str());
-    uploadFile = LittleFS.open("/teensy41.hex", FILE_WRITE);
-    if (!uploadFile) { Serial.println("[HTTP] open for write failed"); }
-  }
-  else if (up.status == UPLOAD_FILE_WRITE) {
-    if (uploadFile) uploadFile.write(up.buf, up.currentSize);
-  }
-  else if (up.status == UPLOAD_FILE_END) {
-    if (!uploadFile) { server.send(500, "text/plain", "Upload failed to open file"); return; }
-    uploadFile.close();
-    Serial.printf("[HTTP] Upload complete: %s bytes=%u\n", uploadName.c_str(), up.totalSize);
-
-    if (!uploadedWasHex) {
-      LittleFS.remove("/teensy41.hex");
-      server.send(415, "text/plain", "Please upload the Teensy Intel HEX (.hex) file.");
-      return;
-    }
-
-    String log;
-    bool ok = flashTeensyFromFS("/teensy41.hex", log);
-
-    lastOtaSuccess = ok;
-    lastOtaLog = log;
-    lastOtaMillis = millis();
-
-    Serial.println("[OTA RESULT]\n" + log);
-    server.send(ok ? 200 : 500, "text/plain", ok ? "OK\n" : "ERR\n");
-  }
-}
-
-// ---------- setup / loop ----------
+// ===== setup/loop =====
 void setup() {
   Serial.begin(115200);
-  delay(200);
-  Serial.println("\n== ESP32 → Teensy OTA + Console ==");
+  delay(150);
 
-  ensureLittleFS();
-  connectWifi();
+  // Mute only the noisy ESP-IDF I2C driver lines, keep your own prints:
+  esp_log_level_set("i2c",        ESP_LOG_WARN);
+  esp_log_level_set("i2c.master", ESP_LOG_WARN);
 
-  SerialTeensy.setRxBufferSize(4096);
-  SerialTeensy.setTxBufferSize(1024);
-  SerialTeensy.begin(115200, SERIAL_8N1, TEENSY_RX, TEENSY_TX);
-  Serial.printf("[UART] SerialTeensy on RX=%d TX=%d @115200\n", TEENSY_RX, TEENSY_TX);
+  // Bring up OTA hub + web + consoles
+  OtaHub::begin(WIFI_SSID, WIFI_PASS, OTA_TOKEN, "esp32-teensy");
 
-  server.on("/",        HTTP_GET,  handleRoot);
-  server.on("/upload",  HTTP_POST, [](){}, handleUpload);
-  server.on("/ping",    HTTP_GET,  handlePing);
-  server.on("/version", HTTP_GET,  handleVersion);
-  server.on("/last",    HTTP_GET,  handleLast);
-  server.on("/console", HTTP_GET,  handleConsolePage);
-  server.on("/tail",    HTTP_GET,  handleTail);
-  server.begin();
-  Serial.println("[HTTP] Server ready.");
+  // I2C init
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
+  Wire.setClock(I2C_CLK_HZ);
+  Wire.setTimeOut(I2C_XFER_TO_MS);
+
+#if PRINT_OUT5_VOLTS
+  analogReadResolution(12);         // 0..4095
+  pinMode(ANGLE_ANALOG_PIN, INPUT);
+#endif
+
+  LOG("[AS5600] Ready. Keys: (none needed) — printing every 100ms.");
 }
 
 void loop() {
-  pumpTeensyConsole();
-  server.handleClient();
+  // keep OTA hub alive
+  OtaHub::loop();
 
-  static unsigned long lastCheck = 0;
-  if (millis()-lastCheck > 3000) {
-    lastCheck = millis();
-    if (WiFi.status() != WL_CONNECTED) { Serial.println("[WiFi] Lost, rebooting"); delay(250); ESP.restart(); }
+  const unsigned long now = millis();
+
+  // Decide whether to query I2C this cycle
+  const bool inQuiet = (now - gSteerFlipMs) < QUIET_MS;
+
+  uint16_t raw = 0;
+  bool readOK = false;
+
+  if (!inQuiet) {
+    // Try a live I2C read
+    readOK = as5600_read_raw(raw);
+    if (readOK) { lastGoodRaw = raw; haveGood = true; }
+  } else {
+    // In quiet zone: reuse last-good value (no bus traffic during motor surge)
+    if (haveGood) { raw = lastGoodRaw; readOK = true; }
+  }
+
+  // Convert to degree; if no data yet, keep deg as NaN (prints "NaN")
+  float deg = NAN;
+  if (readOK) {
+    deg = ticksToDeg(raw);
+    deg = emaDeg.update(deg);
+  }
+
+#if PRINT_OUT5_VOLTS
+  // Optional analog OUT reading (smoothed)
+  int   adc    = analogRead(ANGLE_ANALOG_PIN);
+  float volts  = (3.3f * (float)adc) / 4095.0f;
+  float v_sm   = emaVolts.update(volts);
+#endif
+
+  // Console print (mirrors to USB + /esp32-console)
+  if ((now - lastPrint) >= PRINT_PERIOD_MS) {
+    lastPrint = now;
+
+    if (readOK) {
+    #if PRINT_OUT5_VOLTS
+      LOGF("AS5600 raw=%u  deg=%.2f  OUT5=%.3fV", raw, deg, v_sm);
+    #else
+      LOGF("AS5600 raw=%u  deg=%.2f", raw, deg);
+    #endif
+    } else {
+    #if PRINT_OUT5_VOLTS
+      LOGF("AS5600 raw=ERR  deg=NaN  OUT5=%.3fV", v_sm);
+    #else
+      LOG("AS5600 raw=ERR  deg=NaN");
+    #endif
+    }
   }
 }
+
+/* ===========================
+   How to tell the code about a steer flip
+   ---------------------------
+   Wherever you flip your steering direction (the exact moment the H-bridge/MOSFETs
+   change polarity), call:
+
+       markSteerFlip();
+
+   That starts a QUIET_MS-long window where we reuse the last good angle instead of
+   talking to the I²C bus. This avoids transient NACKs and keeps your serial/web output
+   smooth through the surge. Tune QUIET_MS at the top if needed.
+*/
