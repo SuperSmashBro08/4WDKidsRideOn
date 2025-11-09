@@ -27,7 +27,7 @@ struct TelemetryPayload;
 #endif
 
 // ---------- App identity ----------
-#define APP_FW_VERSION   "V 3.3.6"
+#define APP_FW_VERSION   "V 3.3.7"
 
 // ---------- Blink ----------
 #define LED_PIN          13
