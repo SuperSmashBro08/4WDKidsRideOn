@@ -1,13 +1,14 @@
 #pragma once
 // ===== Mad Labs ESP32 OTA Hub (header-only) =====
-// Encapsulates: WebServer UI, Teensy .hex OTA over UART, ESP32 self-OTA .bin,
-// live consoles, persisted last-result, and reboot-friendly upload UX.
+// Web UI, Teensy .hex OTA over UART, ESP32 self-OTA .bin,
+// live consoles, persisted last-result, reboot-friendly upload UX,
+// plus diagnostics: UART1 stats, I2C scan, AS5600 dump.
 
 #ifndef APP_NAME
   #define APP_NAME "ESP32_Uploader"
 #endif
 #ifndef APP_VER
-  #define APP_VER  "v1.1.6"
+  #define APP_VER  "v1.2.3"
 #endif
 #ifndef TEENSY_TX
   #define TEENSY_TX 43
@@ -16,12 +17,27 @@
   #define TEENSY_RX 44
 #endif
 
+// Teensy live console filter:
+// 0 = store ALL non-empty lines; 1 = only lines starting with "S "
+#ifndef TEENSY_CON_REQUIRE_S
+  #define TEENSY_CON_REQUIRE_S 0
+#endif
+
+// I2C pins (default to SDA=8, SCL=9 for your board; override if needed)
+#ifndef I2C_SDA_PIN
+  #define I2C_SDA_PIN 8
+#endif
+#ifndef I2C_SCL_PIN
+  #define I2C_SCL_PIN 9
+#endif
+
 #include <WiFi.h>
 #include <WebServer.h>
 #include <LittleFS.h>
 #include <ESPmDNS.h>
 #include <Update.h>
-#include <stdarg.h>   // for ELOGF
+#include <Wire.h>      // NEW: for I2C diagnostics/AS5600
+#include <stdarg.h>    // for ELOGF
 
 // ---- Optional ESP-IDF rollback marking ----
 #ifndef __has_include
@@ -64,7 +80,7 @@ namespace {
   static bool   esp32LastSuccess = false;
   static unsigned long esp32LastMillis = 0;
 
-  // Teensy live console buffer (keeps only lines starting with "S ")
+  // Teensy live console buffer
   static const uint16_t CON_CAP = 500;
   static String         conBuf[CON_CAP];
   static uint32_t       conId = 0;
@@ -74,6 +90,11 @@ namespace {
   static const uint16_t E_CON_CAP = 800;
   static String         eConBuf[E_CON_CAP];
   static uint32_t       eConId = 0;
+
+  // UART1 diagnostics (NEW)
+  static volatile uint32_t uart1_rx_bytes = 0;
+  static volatile uint32_t uart1_lines    = 0;
+  static uint32_t          uart1_last_ms  = 0;
 
   // ----- Utilities -----
   static inline void conStore(const String& s){ ++conId; conBuf[conId % CON_CAP] = s; }
@@ -144,17 +165,46 @@ namespace {
     out.trim(); return out.length()>0;
   }
 
+  // === Teensy console pump (robust CR/LF + idle flush) ===
   static void pumpTeensyConsole(){
-    while(SerialTeensy.available()){
-      char c=(char)SerialTeensy.read();
-      if(c=='\r') continue;
-      if(c=='\n'){
+    static bool lastWasCR = false;
+    static uint32_t lastByteMs = 0;
+
+    while (SerialTeensy.available()){
+      char c = (char)SerialTeensy.read();
+      uart1_rx_bytes++;
+      lastByteMs = uart1_last_ms = millis();
+
+      if (c == '\r' || c == '\n'){
+        if (c == '\n' && lastWasCR) { lastWasCR = false; continue; }
+        lastWasCR = (c == '\r');
+
         conLine.trim();
-        if(conLine.startsWith("S ")) conStore(conLine);
-        conLine="";
+        if (conLine.length()){
+          #if TEENSY_CON_REQUIRE_S
+            if (conLine.startsWith("S ")) conStore(conLine);
+          #else
+            conStore(conLine);
+          #endif
+          uart1_lines++;
+        }
+        conLine = "";
       } else {
-        if(conLine.length()<512) conLine+=c;
+        lastWasCR = false;
+        if (conLine.length() < 512) conLine += c;
       }
+    }
+
+    // idle flush (if newline never arrives)
+    if (conLine.length() && (millis() - lastByteMs) > 250){
+      conLine.trim();
+      #if TEENSY_CON_REQUIRE_S
+        if (conLine.startsWith("S ")) conStore(conLine);
+      #else
+        conStore(conLine);
+      #endif
+      conLine = "";
+      uart1_lines++;
     }
   }
 
@@ -289,6 +339,80 @@ namespace {
       if (summary=="APPLIED" || summary.startsWith("HEX ERR")) break;
     }
     return success && (bad==0);
+  }
+
+  // ---------- Diagnostics: UART1 + I2C + AS5600 ----------
+  static void handleUart1Stats(){
+    String out; out.reserve(256);
+    out += "rx_bytes="; out += String(uart1_rx_bytes);
+    out += "  lines=";  out += String(uart1_lines);
+    out += "  last_ms="; out += String(uart1_last_ms);
+    out += "\n";
+    uint32_t cur = conId;
+    if (cur){
+      out += "tail: ";
+      const String& line = conBuf[cur % CON_CAP];
+      if (line.length()){
+        if (line.length() > 120) out += line.substring(line.length()-120);
+        else out += line;
+      } else out += "<empty>";
+      out += "\n";
+    }
+    server.send(200, "text/plain", out);
+  }
+
+  static bool i2cReadN(uint8_t addr, uint8_t reg, uint8_t *buf, uint8_t n){
+    Wire.beginTransmission(addr);
+    Wire.write(reg);
+    if (Wire.endTransmission(false) != 0) return false;
+    int got = Wire.readBytes(buf, n);
+    return got == n;
+  }
+
+  static void handleI2CScan(){
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 400000);
+    String out; out.reserve(512);
+    out += "Scanning I2C on SDA="; out += String(I2C_SDA_PIN);
+    out += " SCL="; out += String(I2C_SCL_PIN); out += "\n";
+    uint8_t found = 0;
+    for (uint8_t a=0x03; a<=0x77; ++a){
+      Wire.beginTransmission(a);
+      uint8_t e = Wire.endTransmission();
+      if (e == 0){
+        out += "  - 0x"; out += String(a, HEX); out += "\n";
+        found++;
+      }
+    }
+    if (!found) out += "  (no devices)\n";
+    server.send(200, "text/plain", out);
+  }
+
+  static void handleAS5600Dump(){
+    const uint8_t ADDR = 0x36;
+    Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 400000);
+
+    String out; out.reserve(256);
+    out += "AS5600 @ 0x36\n";
+
+    uint8_t st=0;
+    if (i2cReadN(ADDR, 0x0B, &st, 1)){
+      out += "STATUS 0x0B = 0x"; out += String(st, HEX); out += "  (MD=";
+      out += (st & 0x20) ? "1" : "0"; out += ", ML="; out += (st & 0x10) ? "1" : "0";
+      out += ", MH="; out += (st & 0x08) ? "1" : "0"; out += ")\n";
+    } else {
+      out += "STATUS read failed\n";
+    }
+
+    uint8_t b[2];
+    if (i2cReadN(ADDR, 0x0C, b, 2)){
+      uint16_t raw = ((uint16_t)(b[0] & 0x0F) << 8) | b[1];
+      float deg = raw * (360.0f/4096.0f);
+      out += "ANGLE  raw="; out += String(raw);
+      out += "  deg="; out += String(deg, 2); out += "\n";
+    } else {
+      out += "ANGLE read failed\n";
+    }
+    server.send(200, "text/plain", out);
   }
 
   // ---------- Pages (Teensy & ESP32 consoles + Index) ----------
@@ -498,7 +622,7 @@ namespace {
       "const fillT=document.getElementById('fill-teensy');"
       "const statT=document.getElementById('status-teensy');"
       "function finalizeTeensyUI(ok){fillT.className=ok?'fill ok':'fill bad';statT.textContent=ok?'Flashing complete.':'Upload failed.';setTimeout(function(){window.location='/'},900);}"
-      "async function checkTeensyLast(){try{const r=await fetch('/last',{cache:'no-store'});const t=await r.text();finalizeTeensyUI(t.trim()==='OK');}catch(e){finalizeTeensyUI(false);}}"
+      "async function checkTeensyLast(){try{const r=await fetch('/last',{cache:'no-store'});const t=await r.text();finalizeTeensyUI(t.trim()==='OK');}catch(e){finalizeTeensyLast(false);}}"
       "ft.addEventListener('submit',function(e){"
         "e.preventDefault();"
         "if(!fT.files.length){alert('Choose a .hex first');return;}"
@@ -740,6 +864,11 @@ namespace {
     server.on("/esp32-version", HTTP_GET,  handleEspVersion);
     server.on("/esp32-console", HTTP_GET,  handleEsp32ConsolePage);
     server.on("/esp32-tail",    HTTP_GET,  handleEsp32Tail);
+
+    // Diagnostics (NEW)
+    server.on("/uart1-stats",   HTTP_GET,  handleUart1Stats);
+    server.on("/i2c-scan",      HTTP_GET,  handleI2CScan);
+    server.on("/as5600-dump",   HTTP_GET,  handleAS5600Dump);
   }
 
 } // namespace (private)
@@ -758,6 +887,9 @@ void begin(const char* wifiSsid, const char* wifiPass, const char* otaToken,
 
   ensureLittleFS();
   connectWifi(mdnsHost);
+
+  // Start I2C early so diagnostics are ready
+  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN, 400000);
 
   SerialTeensy.setRxBufferSize(4096);
   SerialTeensy.setTxBufferSize(1024);
