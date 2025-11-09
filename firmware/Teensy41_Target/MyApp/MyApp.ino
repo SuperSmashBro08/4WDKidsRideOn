@@ -9,6 +9,10 @@
 //
 // If you want USB prints too:  LOG usb   or   LOG both   on the USB serial.
 
+#ifndef ENABLE_TEENSY_BINARY_TELEM
+#define ENABLE_TEENSY_BINARY_TELEM 0
+#endif
+
 struct TelemetryPayload;
 
 #include <Arduino.h>
@@ -116,6 +120,7 @@ static inline int16_t toCenti(float v){
 }
 
 static void emitTelemetry(const TelemetryPayload& payload){
+#if ENABLE_TEENSY_BINARY_TELEM
   if (OtaUpdater::inProgress()) return;
   TelemetryPacket pkt{};
   pkt.magic0  = TELEM_MAGIC0;
@@ -124,6 +129,9 @@ static void emitTelemetry(const TelemetryPayload& payload){
   pkt.length  = sizeof(TelemetryPayload);
   pkt.payload = payload;
   Serial2.write(reinterpret_cast<const uint8_t*>(&pkt), sizeof(pkt));
+#else
+  (void)payload;
+#endif
 }
 
 // ================= NAMESPACE =================
@@ -421,6 +429,11 @@ void setup(){
   SLOGF("MyApp RAW+STEER FW=%s  (blink=%d ms)\r\n", APP_FW_VERSION, BLINK_MS);
   SLOGF("BOOT_PINS fwd=%d rev=%d (0=LOW,1=HIGH)\r\n",
         (int)digitalRead(PIN_FWD), (int)digitalRead(PIN_REV));
+#if ENABLE_TEENSY_BINARY_TELEM
+  SLOGF("UART telemetry: binary packets enabled\r\n");
+#else
+  SLOGF("UART telemetry: binary packets disabled (ASCII only)\r\n");
+#endif
 }
 
 void loop(){

@@ -21,6 +21,11 @@
   #define TEENSY_RX 44
 #endif
 
+// Teensy binary telemetry toggle (set to 1 when Teensy firmware emits it)
+#ifndef ENABLE_TEENSY_BINARY_TELEM
+  #define ENABLE_TEENSY_BINARY_TELEM 0
+#endif
+
 // Teensy live console filter:
 // 0 = store ALL non-empty lines; 1 = only lines starting with "S "
 #ifndef TEENSY_CON_REQUIRE_S
@@ -141,6 +146,7 @@ namespace {
   static uint32_t        telemetryDropCount = 0;
   static uint32_t        telemetryUpdatedMs = 0;
 
+#if ENABLE_TEENSY_BINARY_TELEM
   enum class TelemetryState : uint8_t { WaitMagic0, WaitMagic1, WaitVersion, WaitLength, ReadPayload, SkipPayload };
 
   struct TelemetryStreamParser {
@@ -248,6 +254,20 @@ namespace {
   static bool telemetryConsumeByte(uint8_t b){
     return telemetryParser.consume(b);
   }
+#else
+  static inline void telemetryResetParser(){
+    telemetryValid = false;
+    telemetryHasSeq = false;
+    telemetryLastSeq = 0;
+    telemetryDropCount = 0;
+    telemetryUpdatedMs = 0;
+    memset(&latestTelem, 0, sizeof(latestTelem));
+  }
+
+  static bool telemetryConsumeByte(uint8_t){
+    return false;
+  }
+#endif
 
   static void drainTeensyInput(){
     while (SerialTeensy.available()){
@@ -1152,6 +1172,11 @@ void begin(const char* wifiSsid, const char* wifiPass, const char* otaToken,
   telemetryResetParser();
   Serial.printf("[UART] SerialTeensy on RX=%d TX=%d @230400\n", TEENSY_RX, TEENSY_TX);
   ELOGF("UART to Teensy: RX=%d TX=%d @230400", TEENSY_RX, TEENSY_TX);
+#if ENABLE_TEENSY_BINARY_TELEM
+  ELOG("Binary telemetry parser enabled.");
+#else
+  ELOG("Binary telemetry parser disabled (expecting ASCII-only stream).");
+#endif
 
   setupRoutes();
   server.begin();
