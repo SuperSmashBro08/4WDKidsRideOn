@@ -271,6 +271,8 @@ namespace {
   }
 #endif
 
+  static inline void conStore(const String& s);
+
   static inline void flushConsoleLine(){
     if (!conLine.length()) return;
     conLine.trim();
