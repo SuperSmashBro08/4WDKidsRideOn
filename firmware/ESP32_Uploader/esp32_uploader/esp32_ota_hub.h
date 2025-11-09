@@ -95,6 +95,8 @@ namespace {
   static String         conBuf[CON_CAP];
   static uint32_t       conId = 0;
   static String         conLine;
+  static bool           conLastWasCR = false;
+  static uint32_t       conLastTextByteMs = 0;
 
   // ESP32 live console (our own log ring)
   static const uint16_t E_CON_CAP = 800;
@@ -269,12 +271,64 @@ namespace {
   }
 #endif
 
+  static inline void conStore(const String& s);
+
+  static inline void flushConsoleLine(){
+    if (!conLine.length()) return;
+    conLine.trim();
+    if (!conLine.length()) { conLine = ""; return; }
+
+    bool stored = false;
+#if TEENSY_CON_REQUIRE_S
+    if (conLine.startsWith("S ")){
+      String trimmed = conLine;
+      trimmed.remove(0, 2);
+      conStore(trimmed);
+      stored = true;
+    }
+#else
+    String trimmed = conLine;
+    if (trimmed.startsWith("S ")) trimmed.remove(0, 2);
+    conStore(trimmed);
+    stored = true;
+#endif
+    conLine = "";
+    if (stored) uart1_lines++;
+  }
+
+  static inline void flushConsoleIdle(bool force=false){
+    if (!conLine.length()) return;
+    uint32_t nowMs = millis();
+    if (!force && conLastTextByteMs != 0 && (uint32_t)(nowMs - conLastTextByteMs) <= 120) return;
+    flushConsoleLine();
+  }
+
+  static inline void processTeensyByte(uint8_t byte){
+    uint32_t nowMs = millis();
+    uart1_rx_bytes++;
+    uart1_last_ms = nowMs;
+    if (telemetryConsumeByte(byte)) return;
+
+    char c = (char)byte;
+    if (c == '\r' || c == '\n'){
+      if (c == '\n' && conLastWasCR) { conLastWasCR = false; return; }
+      conLastWasCR = (c == '\r');
+      conLastTextByteMs = nowMs;
+      flushConsoleLine();
+    } else {
+      conLastWasCR = false;
+      conLastTextByteMs = nowMs;
+      if (conLine.length() < 512) conLine += c;
+    }
+  }
+
   static void drainTeensyInput(){
     while (SerialTeensy.available()){
       int raw = SerialTeensy.read();
       if (raw < 0) break;
-      telemetryConsumeByte((uint8_t)raw);
+      processTeensyByte((uint8_t)raw);
     }
+    flushConsoleIdle();
   }
 
   // ----- Utilities -----
@@ -353,74 +407,13 @@ namespace {
 
   // === Teensy console pump (robust CR/LF + idle flush) ===
   static void pumpTeensyConsole(){
-    static bool lastWasCR = false;
-    static uint32_t lastByteMs = 0;
-    static uint32_t lastTextByteMs = 0;
-
     while (SerialTeensy.available()){
       int raw = SerialTeensy.read();
       if (raw < 0) break;
-      uint8_t byte = (uint8_t)raw;
-      uart1_rx_bytes++;
-      uint32_t nowMs = millis();
-      lastByteMs = uart1_last_ms = nowMs;
-
-      if (telemetryConsumeByte(byte)){
-        continue;
-      }
-
-      char c = (char)byte;
-      if (c == '\r' || c == '\n'){
-        if (c == '\n' && lastWasCR) { lastWasCR = false; continue; }
-        lastWasCR = (c == '\r');
-        lastTextByteMs = nowMs;
-
-        conLine.trim();
-        if (conLine.length()){
-          bool stored=false;
-          #if TEENSY_CON_REQUIRE_S
-            if (conLine.startsWith("S ")){
-              String trimmed = conLine;
-              trimmed.remove(0,2);
-              conStore(trimmed);
-              stored=true;
-            }
-          #else
-            String trimmed = conLine;
-            if (trimmed.startsWith("S ")) trimmed.remove(0,2);
-            conStore(trimmed);
-            stored=true;
-          #endif
-          if (stored) uart1_lines++;
-        }
-        conLine = "";
-      } else {
-        lastWasCR = false;
-        lastTextByteMs = nowMs;
-        if (conLine.length() < 512) conLine += c;
-      }
+      processTeensyByte((uint8_t)raw);
     }
 
-    // idle flush (if newline never arrives)
-    if (conLine.length() && (millis() - lastTextByteMs) > 120){
-      conLine.trim();
-      bool stored=false;
-      #if TEENSY_CON_REQUIRE_S
-        if (conLine.startsWith("S ")){
-          String trimmed = conLine;
-          trimmed.remove(0,2);
-          conStore(trimmed);
-          stored=true;
-        }
-      #else
-        String trimmed = conLine;
-        if (trimmed.startsWith("S ")) trimmed.remove(0,2);
-        conStore(trimmed);
-        stored=true;
-      #endif
-      conLine = "";
-      if (stored) uart1_lines++;
-    }
+    flushConsoleIdle();
   }
 
   // ---------- Persist ESP32 last-OTA result across reboot ----------
