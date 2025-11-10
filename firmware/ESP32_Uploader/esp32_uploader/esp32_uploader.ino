@@ -1,6 +1,6 @@
 // ===== App identity =====
 #define APP_NAME "ESP32_Uploader"
-#define APP_VER  "v1.3.1"   // bumped
+#define APP_VER  "v1.3.2-2B"   // <-- bumped for Step 2B
 
 // ===== Teensy UART pins (unchanged) =====
 #define TEENSY_TX 43
@@ -15,21 +15,35 @@
 
 // ===== App print options =====
 #define PRINT_OUT5_VOLTS   0   // 0 = hide analog voltage column, 1 = show it
-#define PRINT_PERIOD_MS  100   // print every 100ms
+#define PRINT_PERIOD_MS  100   // web/USB console print period
 
-// ===== Quiet window after steer direction change =====
-// We skip fresh I2C reads for this period and reuse last-good value.
-#define QUIET_MS          180  // try 120..250 as needed
+// ===== AS → Teensy emit options =====
+#define AS_PUSH_ENABLE        1       // 1 = send AS,<raw>,<deg> to Teensy
+#define AS_PUSH_PERIOD_MS     50      // 20 Hz to Teensy
+#define AS_DEG_DECIMALS       2       // keep it compact
+#define AS_EMIT_WHEN_INVALID  0       // 0 = skip if no fresh reading
+
+// ===== Quiet window after steer direction flip =====
+#define QUIET_MS              180     // reuse last-good during motor surge
 
 #include <Arduino.h>
 #include <Wire.h>
 #include "esp_log.h"            // for esp_log_level_set(...)
-#include "secrets.h"            // #define WIFI_SSID "...", WIFI_PASS "...", OTA_TOKEN "..."
-#include "esp32_ota_hub.h"      // OTA hub header (updated below)
+#include "secrets.h"            // WIFI_SSID, WIFI_PASS, OTA_TOKEN
+#include "esp32_ota_hub.h"      // OTA hub header (with 2 / 2a pacing hardening)
 
 // ---- Web console logging shortcuts (mirror to USB + /esp32-console)
 #define LOG(s)        OtaHub::ELOG(s)
 #define LOGF(...)     OtaHub::ELOGF(__VA_ARGS__)
+
+// ===== Small shim to talk to Teensy via the hub =====
+// Add two tiny helpers in esp32_ota_hub.h (shown below): teensyPrintln(), isTeensyFlashing()
+static inline void TeensySendLine(const char* s){
+  OtaHub::teensyPrintln(s);   // safe; hub UART already opened at 230400
+}
+static inline bool TeensyIsFlashing(){
+  return OtaHub::isTeensyFlashing();
+}
 
 // ===== AS5600 registers / address =====
 static const uint8_t  AS5600_ADDR     = 0x36;
@@ -41,7 +55,6 @@ static const uint32_t I2C_XFER_TO_MS  = 40;     // per transfer timeout
 
 // ===== Helpers =====
 static inline float ticksToDeg(uint16_t t12) { return (360.0f * (float)t12) / 4096.0f; }
-static inline int   wrapDist(int a, int b) { int d=b-a; while(d<-2048) d+=4096; while(d>=2048) d-=4096; return d; }
 
 // Simple EMA (no templates)
 struct EMA {
@@ -92,7 +105,10 @@ static EMA   emaVolts(0.20f);   // smoothed analog volts
 #endif
 static uint16_t lastGoodRaw = 0;
 static bool     haveGood    = false;
-static unsigned long lastPrint = 0;
+static unsigned long lastPrintMs = 0;
+
+// AS line rate limiter
+static unsigned long lastEmitMs = 0;
 
 void setup() {
   Serial.begin(115200);
@@ -115,7 +131,7 @@ void setup() {
   pinMode(ANGLE_ANALOG_PIN, INPUT);
 #endif
 
-  LOG("[AS5600] Ready. Keys: (none needed) — printing every 100ms.");
+  LOG("[AS5600] Ready. Keys: (none needed) — printing every 100ms. AS push to Teensy enabled.");
 }
 
 void loop() {
@@ -153,10 +169,9 @@ void loop() {
   float v_sm   = emaVolts.update(volts);
 #endif
 
-  // Console print (mirrors to USB + /esp32-console)
-  if ((now - lastPrint) >= PRINT_PERIOD_MS) {
-    lastPrint = now;
-
+  // ====== 1) Mirror to web/USB console ======
+  if ((now - lastPrintMs) >= PRINT_PERIOD_MS) {
+    lastPrintMs = now;
     if (readOK) {
     #if PRINT_OUT5_VOLTS
       LOGF("AS5600 raw=%u  deg=%.2f  OUT5=%.3fV", raw, deg, v_sm);
@@ -171,6 +186,29 @@ void loop() {
     #endif
     }
   }
+
+  // ====== 2) Push to Teensy as "AS,<raw>,<deg>" ======
+#if AS_PUSH_ENABLE
+  const bool okToEmit = readOK || AS_EMIT_WHEN_INVALID;
+  if (okToEmit && (now - lastEmitMs) >= AS_PUSH_PERIOD_MS) {
+    lastEmitMs = now;
+
+    // If hub is currently flashing the Teensy, pause emissions to avoid line collisions
+    if (!TeensyIsFlashing()) {
+      char line[40];
+      if (readOK) {
+        // keep it compact for parser + bandwidth
+        dtostrf(deg, 0, AS_DEG_DECIMALS, line);  // temp reuse; we'll overwrite
+        // safer build:
+        snprintf(line, sizeof(line), "AS,%u,%.2f", (unsigned)raw, (double)deg);
+      } else {
+        // If ever allowed, you could emit a sentinel here (we default to skip)
+        snprintf(line, sizeof(line), "AS,ERR,NaN");
+      }
+      TeensySendLine(line);   // goes to UART1 (RX=44, TX=43) via hub
+    }
+  }
+#endif
 }
 
 /* ===========================

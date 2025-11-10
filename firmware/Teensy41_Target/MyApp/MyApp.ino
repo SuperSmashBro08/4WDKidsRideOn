@@ -1,16 +1,15 @@
-// ============ MyApp.ino (V 3.3.7 RAW + Steering Control, single-UART, S-prefixed console) ============
+// ============ MyApp.ino  (V 3.4.0 • RAW + Steering Control, single-UART, S-prefixed console) ============
 //
-// - RAW snapshot line every ~30 ms (S1/T1/S2/T2/FNR)
+// - RAW snapshot line every ~30 ms: S RAW S1/T1/S2/T2/FNR plus AS angle (when fresh)
 // - ESP32 angle stream over the SAME UART (Serial2) via OtaUpdater hook
 //   expected line from ESP32: "AS,<raw>,<deg>"
 // - Motor driver: BTS7960-style on pins 15..18 (LPWM/RPWM/L_EN/R_EN)
 // - 20 kHz PWM for quiet steering drive
-// - OTA + console share Serial2; non-OTA lines are delegated to this sketch via hook
+// - OTA + console share Serial2; non-OTA lines are delegated here via OtaUserHandleLine()
 //
-// Notes
-// - We only consume: PING, VERSION, and AS,<raw>,<deg>. Everything else returns false so
-//   the flasher sees HELLO/BEGIN/L .../END.
-// - Every log line that goes to the ESP32 console is forced to start with "S ".
+// We ONLY consume: PING, VERSION, and AS,<raw>,<deg>. Everything else returns false so
+// the flasher sees HELLO/BEGIN/L .../END.
+// Every log line that goes to the ESP32 console is forced to start with "S ".
 //
 // ------------------------------------------------------------------------------------------------------
 
@@ -26,6 +25,7 @@
 #include "OtaUpdater.h"
 #include "OtaConsole.h"
 
+// Teensy compatibility shims (if building outside Teensyduino contexts)
 #ifndef IRAM_ATTR
 #define IRAM_ATTR
 #endif
@@ -34,7 +34,7 @@
 #endif
 
 // ---------- App identity ----------
-#define APP_FW_VERSION   "V 3.3.8"
+#define APP_FW_VERSION   "V 3.4.0"
 
 // ---------- Blink ----------
 #define LED_PIN          13
@@ -44,10 +44,12 @@
 #define RAW_MIRROR_MODE  1   // keep raw stream on
 
 // ---------- IO pins ----------
-static constexpr uint8_t PIN_FWD    = 10;
+static constexpr uint8_t PIN_FWD    = 10;  // F/N/R inputs (active LOW with pullups)
 static constexpr uint8_t PIN_REV    = 11;
-static constexpr uint8_t PIN_POT_S1 = 14;  // steering analog (your pot)
+
+static constexpr uint8_t PIN_POT_S1 = 14;  // steering analog (your pot, used to pick target bucket)
 static constexpr uint8_t PIN_POT_T1 = 27;  // throttle analog
+
 static constexpr uint8_t PIN_RC_S   = 4;   // RC steer PWM in
 static constexpr uint8_t PIN_RC_T   = 5;   // RC throttle PWM in
 
@@ -81,12 +83,16 @@ namespace MM {
 enum FnrState : uint8_t { FNR_NEU=0, FNR_FWD=1, FNR_REV=2, FNR_FAULT=3 };
 static FnrState g_fnr = FNR_NEU;
 static inline const char* fnrWord(FnrState s){
-  switch(s){ case FNR_FWD: return "forward"; case FNR_REV: return "reverse";
-             case FNR_NEU: return "neutral"; default: return "fault"; }
+  switch(s){
+    case FNR_FWD: return "forward";
+    case FNR_REV: return "reverse";
+    case FNR_NEU: return "neutral";
+    default:      return "fault";
+  }
 }
 
 // ===== Live values =====
-static uint16_t g_s1=0, g_t1=0;                  // raw analog
+static uint16_t g_s1=0, g_t1=0;                  // raw analog (S1 steering pot, T1 throttle pot)
 static volatile uint32_t rcS_rise_us=0, rcS_last_update_us=0;
 static volatile uint16_t rcS_width_us=1500;
 static volatile uint32_t rcT_rise_us=0, rcT_last_update_us=0;
@@ -134,16 +140,16 @@ static void sampleFnr(){
 } // namespace MM
 
 // ======= Angle stream (from ESP32) + helpers ==================================
-// The order matters: globals first, then helpers. This avoids "not declared"/linker errors.
-static volatile uint16_t g_as_raw = 0;
-static volatile float    g_as_deg = NAN;
-static volatile uint32_t g_as_ms  = 0;
+// Globals updated from ESP32 CSV "AS,<raw>,<deg>" lines
+static volatile uint16_t g_as_raw = 0;   // 0..4095
+static volatile float    g_as_deg = NAN; // degrees 0..360 wrap (ESP32 smoothed)
+static volatile uint32_t g_as_ms  = 0;   // last update ms
 
 // Forward decls WITHOUT defaults (avoid duplicate default-arg warnings)
 static inline bool angleFresh(uint32_t maxAgeMs);
 static bool angleSnapshot(uint16_t& rawOut, float& degOut);
 
-// Only consume three strings so the OTA protocol gets through.
+// Hook from OtaUpdater: return true if this line is fully handled here.
 extern "C" bool OtaUserHandleLine(const char* line) {
   if (!line || !*line) return false;
 
@@ -155,28 +161,36 @@ extern "C" bool OtaUserHandleLine(const char* line) {
     return true;
   }
 
-  // Angle packets coming from ESP32
+  // Angle packets coming from ESP32: "AS,<raw>,<deg>"
   if (line[0]=='A' && line[1]=='S' && line[2]==',') {
     const char* p = line + 3;
-    const char* comma = strchr(p, ','); if (!comma) return false;
+    const char* comma1 = strchr(p, ','); if (!comma1) return false;
     uint16_t raw = (uint16_t)strtoul(p, nullptr, 10);
-    float    deg = atof(comma + 1);
-    noInterrupts(); g_as_raw=raw; g_as_deg=deg; g_as_ms=millis(); interrupts();
+    float    deg = atof(comma1 + 1);
+    if (raw <= 4095 && isfinite(deg)) {
+      noInterrupts(); g_as_raw=raw; g_as_deg=deg; g_as_ms=millis(); interrupts();
+    }
     return true;
   }
 
-  return false; // everything else is protocol traffic (HELLO, BEGIN, L..., END)
+  // Everything else is protocol traffic (HELLO/BEGIN/L.../END)
+  return false;
 }
 
 static inline bool angleFresh(uint32_t maxAgeMs) {
-  uint32_t age = millis() - g_as_ms;
-  return (g_as_ms != 0) && (age <= maxAgeMs) && !isnan(g_as_deg);
+  uint32_t stamp, age;
+  noInterrupts(); stamp = g_as_ms; interrupts();
+  if (stamp == 0) return false;
+  age = millis() - stamp;
+  float d; noInterrupts(); d = g_as_deg; interrupts();
+  return (age <= maxAgeMs) && !isnan(d);
 }
+
 static bool angleSnapshot(uint16_t& rawOut, float& degOut) {
   uint16_t raw; float deg; uint32_t stamp;
   noInterrupts(); raw=g_as_raw; deg=g_as_deg; stamp=g_as_ms; interrupts();
   if (stamp == 0 || isnan(deg)) return false;
-  if ((millis() - stamp) > 200)  return false;
+  if ((millis() - stamp) > 250)  return false; // ~4 cycles old @100ms ESP32 feed
   rawOut = raw; degOut = deg; return true;
 }
 
@@ -232,7 +246,7 @@ struct __attribute__((packed)) TelemetryPacket {
 static uint16_t g_telemSeq = 0;
 
 static void emitTelemetry(const TelemetryPayload& payload){
-  if (OtaUpdater::inProgress()) return;
+  if (OtaUpdater::inProgress()) return; // respect OTA silence
   TelemetryPacket pkt{};
   pkt.magic0  = TELEM_MAGIC0;
   pkt.magic1  = TELEM_MAGIC1;
@@ -245,16 +259,16 @@ static void emitTelemetry(const TelemetryPayload& payload){
 
 // ======== Steering controller ==================================================
 namespace Steer {
-  // Calibration
+  // Calibration (YOU CAN TUNE THESE)
   static const float STEER_LEFT_DEG   = 129.07f;
   static const float STEER_RIGHT_DEG  = 201.97f;
   static const float STEER_CENTER_DEG = (STEER_LEFT_DEG + STEER_RIGHT_DEG) * 0.5f;
-  static const float STEER_TOL_DEG    = 1.5f;
-  static const float KP_PWM_PER_DEG   = 6.0f;
+  static const float STEER_TOL_DEG    = 1.5f;      // hold window
+  static const float KP_PWM_PER_DEG   = 6.0f;      // proportional gain
 
-  // Decide target from S1 raw bins
-  static const uint16_t S1_LEFT_MAX   = 1600;  // S1 ≤ this => Left
-  static const uint16_t S1_RIGHT_MIN  = 2400;  // S1 ≥ this => Right
+  // Decide target from S1 raw bins (YOUR POT BUCKETS)
+  static const uint16_t S1_LEFT_MAX   = 1600;      // S1 ≤ this => Left
+  static const uint16_t S1_RIGHT_MIN  = 2400;      // S1 ≥ this => Right
 
   // BTS7960 pins
   static const uint8_t PIN_MOT_LPWM = 15;  // J7-6
@@ -280,9 +294,11 @@ namespace Steer {
     return Target::Center;
   }
   static inline float targetDegFor(Target t){
-    switch (t){ case Target::Left:  return STEER_LEFT_DEG;
-               case Target::Right: return STEER_RIGHT_DEG;
-               default:            return STEER_CENTER_DEG; }
+    switch (t){
+      case Target::Left:  return STEER_LEFT_DEG;
+      case Target::Right: return STEER_RIGHT_DEG;
+      default:            return STEER_CENTER_DEG;
+    }
   }
 
   static void setMotor(int pwmSigned){
@@ -336,7 +352,7 @@ namespace Steer {
     Target tgt = pickTarget(s1raw);
     float  tgtDeg = targetDegFor(tgt);
 
-    if (!::angleFresh(200)){
+    if (!::angleFresh(220)){             // slight slack vs angleSnapshot's 250ms
       setMotor(0);
       if (g_ss != State::NoAngle) enter(State::NoAngle, "no-angle");
       g_lastErrDeg = 0.0f;
@@ -345,7 +361,7 @@ namespace Steer {
       return;
     }
 
-    float cur = ::g_as_deg;
+    float cur; noInterrupts(); cur = ::g_as_deg; interrupts();
     float err = tgtDeg - cur;                      // +err => need to move RIGHT
     int   pwm = (int)(KP_PWM_PER_DEG * err);
 
@@ -472,21 +488,29 @@ void loop(){
     uint16_t as_raw = 0;
     float    as_deg = 0.0f;
     const bool haveAngle = angleSnapshot(as_raw, as_deg);
+
 #if RAW_MIRROR_MODE
-    SLOGF("RAW S1=%u  T1=%u  S2_us=%d(%d)  T2_us=%d(%d)  AS=%u(%d)  FNR=%s\r\n",
-          (unsigned)g_s1,
-          (unsigned)g_t1,
-          (int)g_s2_us, (int)s2_map,
-          (int)g_t2_us, (int)t2_map,
-          (unsigned)(haveAngle ? as_raw : 0u),
-          (int)(haveAngle ? toCenti(as_deg) : INT16_MIN),
-          fnrWord(g_fnr));
+    if (haveAngle) {
+      // prints to ESP32 UI (starts with "S "), and USB sees the same text
+      SLOGF("S RAW S1=%u  T1=%u  S2_us=%d(%d)  T2_us=%d(%d)  AS=%u(%.2f)  FNR=%s\r\n",
+            (unsigned)g_s1, (unsigned)g_t1,
+            (int)g_s2_us, (int)s2_map,
+            (int)g_t2_us, (int)t2_map,
+            (unsigned)as_raw, (double)as_deg,
+            fnrWord(g_fnr));
+    } else {
+      // hide angle completely when not fresh
+      SLOGF("S RAW S1=%u  T1=%u  S2_us=%d(%d)  T2_us=%d(%d)  AS=---  FNR=%s\r\n",
+            (unsigned)g_s1, (unsigned)g_t1,
+            (int)g_s2_us, (int)s2_map,
+            (int)g_t2_us, (int)t2_map,
+            fnrWord(g_fnr));
+    }
 #endif
 
 #if ENABLE_TEENSY_BINARY_TELEM
     // Compose and emit binary telemetry when not flashing
     if (!OtaUpdater::inProgress()){
-      static uint16_t g_telemSeq = 0;
       static constexpr uint32_t RC_STALE_US = 250000; // 250 ms
       const bool rcFresh = ((uint32_t)(nowUs - rcS_last_us) <= RC_STALE_US) &&
                            ((uint32_t)(nowUs - rcT_last_us) <= RC_STALE_US);
@@ -520,7 +544,7 @@ void loop(){
   static uint32_t t_ctrl = 0;
   if (micros() - t_ctrl >= 20000){
     t_ctrl = micros();
-    Steer::tick(MM::g_s1);
+    Steer::tick(MM::g_s1);  // decide target by S1-buckets, then close on AS angle
   }
 
   // Blink
