@@ -1,18 +1,21 @@
 #pragma once
-
 #ifndef ESP32_UPLOADER_ESP32_OTA_HUB_H
 #define ESP32_UPLOADER_ESP32_OTA_HUB_H
 #define ESP32_OTA_HUB_H_INCLUDED
 // ===== Mad Labs ESP32 OTA Hub (header-only) =====
-// Web UI, Teensy .hex OTA over UART, ESP32 self-OTA .bin,
-// live consoles, persisted last-result, reboot-friendly upload UX,
-// plus diagnostics: UART1 stats, I2C scan, AS5600 dump.
+//
+// Changes in v1.3.1:
+// - Added tunable pacing/timeout knobs for Teensy HEX uploads
+// - Increased default per-line delay & ACK timeout to avoid "Line 2 timeout"
+// - Ignore stray "S ", "FW ", "FLASHERX " lines while waiting for OK/BAD
+// - Tiny breather every N lines
+// - Console tail/UI unchanged; binary telemetry support retained via flag
 
 #ifndef APP_NAME
   #define APP_NAME "ESP32_Uploader"
 #endif
 #ifndef APP_VER
-  #define APP_VER  "v1.2.3"
+  #define APP_VER  "v1.3.1"
 #endif
 #ifndef TEENSY_TX
   #define TEENSY_TX 43
@@ -40,16 +43,29 @@
   #define I2C_SCL_PIN 9
 #endif
 
+// ===== NEW: pacing knobs for HEX upload =====
+#ifndef HEX_LINE_DELAY_US
+  #define HEX_LINE_DELAY_US   1500   // was 200 — slower fixes early timeouts
+#endif
+#ifndef HEX_ACK_TIMEOUT_MS
+  #define HEX_ACK_TIMEOUT_MS  5000   // was 1500 — allow slow flash writes
+#endif
+#ifndef HEX_BREATHER_LINES
+  #define HEX_BREATHER_LINES  16     // every N lines, pause briefly
+#endif
+#ifndef HEX_BREATHER_MS
+  #define HEX_BREATHER_MS     5
+#endif
+
 #include <WiFi.h>
 #include <WebServer.h>
 #include <LittleFS.h>
 #include <ESPmDNS.h>
 #include <Update.h>
-#include <Wire.h>      // NEW: for I2C diagnostics/AS5600
-#include <stdarg.h>    // for ELOGF
+#include <Wire.h>
+#include <stdarg.h>
 #include <string.h>
 
-// ---- Optional ESP-IDF rollback marking ----
 #ifndef __has_include
   #define __has_include(x) 0
 #endif
@@ -68,29 +84,27 @@ void begin(const char* wifiSsid, const char* wifiPass, const char* otaToken,
            const char* mdnsHost = "esp32-teensy");
 void loop();
 
+// allow app to log to ESP32 console page
+inline void ELOG(const String& s);
+inline void ELOGF(const char* fmt, ...);
+
 // ---------- Private (implementation) ----------
 namespace {
-  // Build timestamp
   static const char* APP_BUILD_DATE = __DATE__ " " __TIME__;
 
-  // Secrets (provided by begin()) — renamed to avoid macro collisions
   static String HUB_WIFI_SSID, HUB_WIFI_PASS, HUB_OTA_TOKEN;
 
-  // Peripherals
   static HardwareSerial SerialTeensy(1);
   static WebServer server(80);
 
-  // Teensy OTA state
   static String lastOtaLog;
   static bool   lastOtaSuccess = false;
   static unsigned long lastOtaMillis = 0;
 
-  // ESP32 self-OTA state
   static String esp32LastLog;
   static bool   esp32LastSuccess = false;
   static unsigned long esp32LastMillis = 0;
 
-  // Teensy live console buffer
   static const uint16_t CON_CAP = 500;
   static String         conBuf[CON_CAP];
   static uint32_t       conId = 0;
@@ -98,47 +112,27 @@ namespace {
   static bool           conLastWasCR = false;
   static uint32_t       conLastTextByteMs = 0;
 
-  // ESP32 live console (our own log ring)
   static const uint16_t E_CON_CAP = 800;
   static String         eConBuf[E_CON_CAP];
   static uint32_t       eConId = 0;
 
-  // UART1 diagnostics (NEW)
   static volatile uint32_t uart1_rx_bytes = 0;
   static volatile uint32_t uart1_lines    = 0;
   static uint32_t          uart1_last_ms  = 0;
 
-  // Teensy binary telemetry
   static constexpr uint8_t  TELEM_MAGIC0 = 0xA5;
   static constexpr uint8_t  TELEM_MAGIC1 = 0x5A;
   static constexpr uint8_t  TELEM_VERSION = 1;
   static constexpr size_t   TELEM_MAX_PAYLOAD = 64;
 
   struct __attribute__((packed)) TelemetryPayload {
-    uint16_t seq;
-    uint32_t millis;
-    uint16_t flags;
-    uint16_t s1;
-    uint16_t t1;
-    int16_t  s2_us;
-    int16_t  t2_us;
-    int16_t  s2_map;
-    int16_t  t2_map;
-    uint16_t as_raw;
-    int16_t  as_deg_centi;
-    uint8_t  gear;
-    uint8_t  steer_target;
-    uint8_t  steer_state;
-    uint8_t  reserved;
-    int16_t  steer_err_centi;
+    uint16_t seq; uint32_t millis; uint16_t flags; uint16_t s1; uint16_t t1;
+    int16_t s2_us; int16_t t2_us; int16_t s2_map; int16_t t2_map;
+    uint16_t as_raw; int16_t as_deg_centi; uint8_t gear; uint8_t steer_target;
+    uint8_t steer_state; uint8_t reserved; int16_t steer_err_centi;
   };
-
   struct __attribute__((packed)) TelemetryPacket {
-    uint8_t          magic0;
-    uint8_t          magic1;
-    uint8_t          version;
-    uint8_t          length;
-    TelemetryPayload payload;
+    uint8_t magic0, magic1, version, length; TelemetryPayload payload;
   };
 
   static TelemetryPacket latestTelem{};
@@ -150,7 +144,6 @@ namespace {
 
 #if ENABLE_TEENSY_BINARY_TELEM
   enum class TelemetryState : uint8_t { WaitMagic0, WaitMagic1, WaitVersion, WaitLength, ReadPayload, SkipPayload };
-
   struct TelemetryStreamParser {
     TelemetryState state = TelemetryState::WaitMagic0;
     uint8_t        curVersion = 0;
@@ -158,117 +151,45 @@ namespace {
     uint8_t        payload[TELEM_MAX_PAYLOAD] = {};
     uint8_t        pos = 0;
     uint8_t        skip = 0;
-
-    void reset(){
-      state = TelemetryState::WaitMagic0;
-      curVersion = 0;
-      curLength = 0;
-      pos = 0;
-      skip = 0;
-      memset(payload, 0, sizeof(payload));
-    }
-
+    void reset(){ state=TelemetryState::WaitMagic0; curVersion=0; curLength=0; pos=0; skip=0; memset(payload,0,sizeof(payload)); }
     bool consume(uint8_t b){
-      switch (state){
-        case TelemetryState::WaitMagic0:
-          if (b == TELEM_MAGIC0){
-            state = TelemetryState::WaitMagic1;
-            return true;
-          }
-          return false;
-
-        case TelemetryState::WaitMagic1:
-          if (b == TELEM_MAGIC1){
-            state = TelemetryState::WaitVersion;
-            return true;
-          }
-          state = TelemetryState::WaitMagic0;
-          return false;
-
-        case TelemetryState::WaitVersion:
-          curVersion = b;
-          state = TelemetryState::WaitLength;
-          return true;
-
+      switch(state){
+        case TelemetryState::WaitMagic0: if (b==TELEM_MAGIC0){ state=TelemetryState::WaitMagic1; return true; } return false;
+        case TelemetryState::WaitMagic1: if (b==TELEM_MAGIC1){ state=TelemetryState::WaitVersion; return true; } state=TelemetryState::WaitMagic0; return false;
+        case TelemetryState::WaitVersion: curVersion=b; state=TelemetryState::WaitLength; return true;
         case TelemetryState::WaitLength:
-          curLength = b;
-          if (curLength == 0){
-            state = TelemetryState::WaitMagic0;
-            return true;
-          }
-          if (curLength > TELEM_MAX_PAYLOAD){
-            skip = curLength;
-            state = TelemetryState::SkipPayload;
-            return true;
-          }
-          pos = 0;
-          state = TelemetryState::ReadPayload;
-          return true;
-
+          curLength=b;
+          if (!curLength){ state=TelemetryState::WaitMagic0; return true; }
+          if (curLength>TELEM_MAX_PAYLOAD){ skip=curLength; state=TelemetryState::SkipPayload; return true; }
+          pos=0; state=TelemetryState::ReadPayload; return true;
         case TelemetryState::ReadPayload:
-          payload[pos++] = b;
-          if (pos >= curLength){
-            if (curVersion == TELEM_VERSION && curLength == sizeof(TelemetryPayload)){
-              memcpy(&latestTelem.payload, payload, sizeof(TelemetryPayload));
-              latestTelem.magic0 = TELEM_MAGIC0;
-              latestTelem.magic1 = TELEM_MAGIC1;
-              latestTelem.version = curVersion;
-              latestTelem.length  = curLength;
-              telemetryValid      = true;
-              telemetryUpdatedMs  = millis();
-              uint16_t seq        = latestTelem.payload.seq;
-              if (telemetryHasSeq){
-                uint16_t delta = (uint16_t)(seq - telemetryLastSeq);
-                if (delta > 1) telemetryDropCount += (uint32_t)(delta - 1);
-              }
-              telemetryLastSeq = seq;
-              telemetryHasSeq  = true;
+          payload[pos++]=b;
+          if (pos>=curLength){
+            if (curVersion==TELEM_VERSION && curLength==sizeof(TelemetryPayload)){
+              memcpy(&latestTelem.payload,payload,sizeof(TelemetryPayload));
+              latestTelem.magic0=TELEM_MAGIC0; latestTelem.magic1=TELEM_MAGIC1;
+              latestTelem.version=curVersion; latestTelem.length=curLength;
+              telemetryValid=true; telemetryUpdatedMs=millis();
+              uint16_t seq=latestTelem.payload.seq;
+              if (telemetryHasSeq){ uint16_t d=(uint16_t)(seq-telemetryLastSeq); if (d>1) telemetryDropCount+=(uint32_t)(d-1); }
+              telemetryLastSeq=seq; telemetryHasSeq=true;
             }
-            state = TelemetryState::WaitMagic0;
+            state=TelemetryState::WaitMagic0;
           }
           return true;
-
         case TelemetryState::SkipPayload:
-          if (skip){
-            --skip;
-            if (!skip) state = TelemetryState::WaitMagic0;
-          }
+          if (skip){ --skip; if (!skip) state=TelemetryState::WaitMagic0; }
           return true;
       }
-
-      state = TelemetryState::WaitMagic0;
-      return false;
+      state=TelemetryState::WaitMagic0; return false;
     }
   };
-
   static TelemetryStreamParser telemetryParser;
-
-  static inline void telemetryResetParser(){
-    telemetryParser.reset();
-    telemetryValid = false;
-    telemetryHasSeq = false;
-    telemetryLastSeq = 0;
-    telemetryDropCount = 0;
-    telemetryUpdatedMs = 0;
-    memset(&latestTelem, 0, sizeof(latestTelem));
-  }
-
-  static bool telemetryConsumeByte(uint8_t b){
-    return telemetryParser.consume(b);
-  }
+  static inline void telemetryResetParser(){ telemetryParser.reset(); telemetryValid=false; telemetryHasSeq=false; telemetryLastSeq=0; telemetryDropCount=0; telemetryUpdatedMs=0; memset(&latestTelem,0,sizeof(latestTelem)); }
+  static bool telemetryConsumeByte(uint8_t b){ return telemetryParser.consume(b); }
 #else
-  static inline void telemetryResetParser(){
-    telemetryValid = false;
-    telemetryHasSeq = false;
-    telemetryLastSeq = 0;
-    telemetryDropCount = 0;
-    telemetryUpdatedMs = 0;
-    memset(&latestTelem, 0, sizeof(latestTelem));
-  }
-
-  static bool telemetryConsumeByte(uint8_t){
-    return false;
-  }
+  static inline void telemetryResetParser(){ telemetryValid=false; telemetryHasSeq=false; telemetryLastSeq=0; telemetryDropCount=0; telemetryUpdatedMs=0; memset(&latestTelem,0,sizeof(latestTelem)); }
+  static bool telemetryConsumeByte(uint8_t){ return false; }
 #endif
 
   static inline void conStore(const String& s);
@@ -276,66 +197,55 @@ namespace {
   static inline void flushConsoleLine(){
     if (!conLine.length()) return;
     conLine.trim();
-    if (!conLine.length()) { conLine = ""; return; }
+    if (!conLine.length()) { conLine=""; return; }
 
-    bool stored = false;
+    bool stored=false;
 #if TEENSY_CON_REQUIRE_S
     if (conLine.startsWith("S ")){
-      String trimmed = conLine;
-      trimmed.remove(0, 2);
-      conStore(trimmed);
-      stored = true;
+      String trimmed=conLine; trimmed.remove(0,2);
+      conStore(trimmed); stored=true;
     }
 #else
-    String trimmed = conLine;
-    if (trimmed.startsWith("S ")) trimmed.remove(0, 2);
-    conStore(trimmed);
-    stored = true;
+    { String trimmed=conLine; if (trimmed.startsWith("S ")) trimmed.remove(0,2); conStore(trimmed); stored=true; }
 #endif
-    conLine = "";
+    conLine="";
     if (stored) uart1_lines++;
   }
 
   static inline void flushConsoleIdle(bool force=false){
     if (!conLine.length()) return;
-    uint32_t nowMs = millis();
-    if (!force && conLastTextByteMs != 0 && (uint32_t)(nowMs - conLastTextByteMs) <= 120) return;
+    uint32_t nowMs=millis();
+    if (!force && conLastTextByteMs!=0 && (uint32_t)(nowMs-conLastTextByteMs)<=120) return;
     flushConsoleLine();
   }
 
   static inline void processTeensyByte(uint8_t byte){
-    uint32_t nowMs = millis();
-    uart1_rx_bytes++;
-    uart1_last_ms = nowMs;
+    uint32_t nowMs=millis();
+    uart1_rx_bytes++; uart1_last_ms=nowMs;
     if (telemetryConsumeByte(byte)) return;
 
-    char c = (char)byte;
-    if (c == '\r' || c == '\n'){
-      if (c == '\n' && conLastWasCR) { conLastWasCR = false; return; }
-      conLastWasCR = (c == '\r');
-      conLastTextByteMs = nowMs;
-      flushConsoleLine();
+    char c=(char)byte;
+    if (c=='\r' || c=='\n'){
+      if (c=='\n' && conLastWasCR){ conLastWasCR=false; return; }
+      conLastWasCR=(c=='\r'); conLastTextByteMs=nowMs; flushConsoleLine();
     } else {
-      conLastWasCR = false;
-      conLastTextByteMs = nowMs;
-      if (conLine.length() < 512) conLine += c;
+      conLastWasCR=false; conLastTextByteMs=nowMs;
+      if (conLine.length()<512) conLine+=c;
     }
   }
 
   static void drainTeensyInput(){
     while (SerialTeensy.available()){
-      int raw = SerialTeensy.read();
-      if (raw < 0) break;
+      int raw=SerialTeensy.read(); if (raw<0) break;
       processTeensyByte((uint8_t)raw);
     }
     flushConsoleIdle();
   }
 
-  // ----- Utilities -----
-  static inline void conStore(const String& s){ ++conId; conBuf[conId % CON_CAP] = s; }
-  static inline void eConStore(const String& s){ ++eConId; eConBuf[eConId % E_CON_CAP] = s; }
-  static void ELOG(const String& s){ eConStore(s); Serial.println(s); }
-  static void ELOGF(const char* fmt, ...) {
+  static inline void conStore(const String& s){ ++conId; conBuf[conId % CON_CAP]=s; }
+  static inline void eConStore(const String& s){ ++eConId; eConBuf[eConId % E_CON_CAP]=s; }
+  inline void ELOG(const String& s){ eConStore(s); Serial.println(s); }
+  inline void ELOGF(const char* fmt, ...) {
     char buf[256];
     va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
     eConStore(String(buf)); Serial.println(buf);
@@ -375,9 +285,9 @@ namespace {
   }
 
   static String htmlEscape(const String& in) {
-    String out; out.reserve(in.length() + 16);
+    String out; out.reserve(in.length()+16);
     for (size_t i=0;i<in.length();++i) {
-      char c = in[i];
+      char c=in[i];
       if (c=='&') out += F("&amp;");
       else if (c=='<') out += F("&lt;");
       else if (c=='>') out += F("&gt;");
@@ -390,29 +300,26 @@ namespace {
     out=""; unsigned long t0=millis();
     while(millis()-t0<to_ms){
       while(s.available()){
-        int raw = s.read();
-        if (raw < 0) break;
-        uint8_t byte = (uint8_t)raw;
-        if (telemetryConsumeByte(byte)) { t0 = millis(); continue; }
-        if ((byte < 0x20 && byte != '\n' && byte != '\r') || byte >= 0x7F) { t0 = millis(); continue; }
-        char c = (char)byte;
+        int raw=s.read(); if (raw<0) break;
+        uint8_t byte=(uint8_t)raw;
+        if (telemetryConsumeByte(byte)) { t0=millis(); continue; }
+        if ((byte < 0x20 && byte!='\n' && byte!='\r') || byte>=0x7F) { t0=millis(); continue; }
+        char c=(char)byte;
         if(c=='\r') continue;
         if(c=='\n'){ out.trim(); return true; }
         if(out.length()<400) out+=c;
       }
       delay(1); yield();
     }
-    out.trim(); return out.length()>0;
+    out.trim(); return out.length()>0; // if something was gathered, return it
   }
 
   // === Teensy console pump (robust CR/LF + idle flush) ===
   static void pumpTeensyConsole(){
     while (SerialTeensy.available()){
-      int raw = SerialTeensy.read();
-      if (raw < 0) break;
+      int raw = SerialTeensy.read(); if (raw < 0) break;
       processTeensyByte((uint8_t)raw);
     }
-
     flushConsoleIdle();
   }
 
@@ -431,22 +338,22 @@ namespace {
   static bool validateHexFile(File& f, String& err) {
     if (!f) { err="open failed"; return false; }
     if (!f.size()) { err="empty file"; return false; }
-    size_t pos = f.position();
-    String first = f.readStringUntil('\n'); first.trim();
-    while (first.length()==0 && f.available()) { first = f.readStringUntil('\n'); first.trim(); }
+    size_t pos=f.position();
+    String first=f.readStringUntil('\n'); first.trim();
+    while (first.length()==0 && f.available()) { first=f.readStringUntil('\n'); first.trim(); }
     if (first.length()==0 || first[0] != ':') { err="not Intel HEX (no leading colon)"; f.seek(pos); return false; }
     f.seek(0);
     String line, lastNonEmpty;
-    while (f.available()) { line = f.readStringUntil('\n'); line.trim(); if (line.length()) lastNonEmpty = line; }
+    while (f.available()) { line=f.readStringUntil('\n'); line.trim(); if (line.length()) lastNonEmpty=line; }
     f.seek(0);
-    if (lastNonEmpty != ":00000001FF") { err = "missing EOF (:00000001FF)"; return false; }
+    if (lastNonEmpty != ":00000001FF") { err="missing EOF (:00000001FF)"; return false; }
     return true;
   }
 
   static bool expectStartsWith(Stream& s, const char* prefix, String* captured=nullptr, uint32_t to_ms=3000) {
     String line; if (!readLineFrom(s, line, to_ms)) return false;
     Serial.print("<- "); Serial.println(line);
-    if (captured) *captured = line;
+    if (captured) *captured=line;
     return line.startsWith(prefix);
   }
 
@@ -505,16 +412,30 @@ namespace {
 
     f.seek(0);
     size_t lineNumber = 0, ok=0, bad=0;
-    const uint16_t lineDelayUs = 200;
+
     while (f.available()) {
       String rec = f.readStringUntil('\n'); rec.trim();
       if (!rec.length()) continue;
       lineNumber++;
 
+      // Send the record
       SerialTeensy.print("L "); SerialTeensy.print(rec); SerialTeensy.print("\r\n");
 
+      // Wait for ACK, ignoring stray console chatter
       String ack;
-      if (!readLineFrom(SerialTeensy, ack, 1500)) { logOut += "Line " + String(lineNumber) + " timeout\n"; bad++; break; }
+      unsigned long t0 = millis();
+      bool gotAck = false;
+      while ((millis() - t0) < HEX_ACK_TIMEOUT_MS) {
+        if (!readLineFrom(SerialTeensy, ack, 200)) { yield(); continue; }
+        if (ack.startsWith("S ") || ack.startsWith("FW ") || ack.startsWith("FLASHERX ")) {
+          // ignore and keep waiting in the remaining window
+          continue;
+        }
+        gotAck = true;
+        break;
+      }
+
+      if (!gotAck) { logOut += "Line " + String(lineNumber) + " timeout\n"; bad++; break; }
       logOut += "<- " + ack + "\n";
 
       if (ack.startsWith("OK ")) {
@@ -529,7 +450,10 @@ namespace {
       }
 
       logProgress(rec.length()+3);
-      delayMicroseconds(lineDelayUs);
+
+      // Pacing + occasional breather
+      delayMicroseconds(HEX_LINE_DELAY_US);
+      if ((lineNumber % HEX_BREATHER_LINES) == 0) { delay(HEX_BREATHER_MS); yield(); }
       yield();
     }
     f.close();
@@ -591,8 +515,7 @@ namespace {
   }
 
   static void handleTelemetryJson(){
-    String out;
-    out.reserve(320);
+    String out; out.reserve(320);
     if (!telemetryValid){
       out = F("{\"valid\":false}");
     } else {
@@ -675,7 +598,7 @@ namespace {
     server.send(200, "text/plain", out);
   }
 
-  // ---------- Pages (Teensy & ESP32 consoles + Index) ----------
+  // ---------- Pages ----------
   static String buildEsp32ConsolePage() {
     String page;
     page.reserve(2800);
@@ -758,7 +681,7 @@ namespace {
       "<p class='muted'>Upload new firmware for <b>Teensy (.hex)</b> and <b>ESP32 (.bin)</b>, and view live consoles.</p>"
     );
 
-    // Teensy section...
+    // Teensy section
     page += F(
       "<section><h3>Update Teensy (.hex)</h3>"
       "<form id='f-teensy' method='POST' action='/upload' enctype='multipart/form-data'>"
@@ -773,7 +696,7 @@ namespace {
       "<div id='status-teensy'></div></form></section>"
     );
 
-    // ESP32 section...
+    // ESP32 section
     page += F(
       "<section><h3>Update ESP32 (.bin)</h3>"
       "<div class='row'>"
@@ -858,7 +781,6 @@ namespace {
       "</section>"
     );
 
-    // Last results (Teensy + ESP32)
     if (lastOtaLog.length()) {
       page += lastOtaSuccess ? F("<h3 style='color:#0a0'>Last Teensy OTA: success</h3>") : F("<h3 style='color:#b00'>Last Teensy OTA: failed</h3>");
       if (lastOtaMillis) {
@@ -878,7 +800,6 @@ namespace {
       page += F("<pre>"); page += htmlEscape(esp32LastLog); page += F("</pre>");
     }
 
-    // Teensy JS uploader
     page += F(
       "<script>"
       "const ft=document.getElementById('f-teensy');"
@@ -888,7 +809,7 @@ namespace {
       "const fillT=document.getElementById('fill-teensy');"
       "const statT=document.getElementById('status-teensy');"
       "function finalizeTeensyUI(ok){fillT.className=ok?'fill ok':'fill bad';statT.textContent=ok?'Flashing complete.':'Upload failed.';setTimeout(function(){window.location='/'},900);}"
-      "async function checkTeensyLast(){try{const r=await fetch('/last',{cache:'no-store'});const t=await r.text();finalizeTeensyUI(t.trim()==='OK');}catch(e){finalizeTeensyLast(false);}}"
+      "async function checkTeensyLast(){try{const r=await fetch('/last',{cache:'no-store'});const t=await r.text();finalizeTeensyUI(t.trim()==='OK');}catch(e){finalizeTeensyUI(false);}}"
       "ft.addEventListener('submit',function(e){"
         "e.preventDefault();"
         "if(!fT.files.length){alert('Choose a .hex first');return;}"
@@ -1133,7 +1054,7 @@ namespace {
     server.on("/esp32-console", HTTP_GET,  handleEsp32ConsolePage);
     server.on("/esp32-tail",    HTTP_GET,  handleEsp32Tail);
 
-    // Diagnostics (NEW)
+    // Diagnostics
     server.on("/uart1-stats",   HTTP_GET,  handleUart1Stats);
     server.on("/i2c-scan",      HTTP_GET,  handleI2CScan);
     server.on("/as5600-dump",   HTTP_GET,  handleAS5600Dump);

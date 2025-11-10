@@ -1,6 +1,6 @@
 // ===== App identity =====
 #define APP_NAME "ESP32_Uploader"
-#define APP_VER  "v1.3.0"   // bump as you like
+#define APP_VER  "v1.3.1"   // bumped
 
 // ===== Teensy UART pins (unchanged) =====
 #define TEENSY_TX 43
@@ -25,7 +25,7 @@
 #include <Wire.h>
 #include "esp_log.h"            // for esp_log_level_set(...)
 #include "secrets.h"            // #define WIFI_SSID "...", WIFI_PASS "...", OTA_TOKEN "..."
-#include "esp32_ota_hub.h"      // your OTA hub header
+#include "esp32_ota_hub.h"      // OTA hub header (updated below)
 
 // ---- Web console logging shortcuts (mirror to USB + /esp32-console)
 #define LOG(s)        OtaHub::ELOG(s)
@@ -43,7 +43,7 @@ static const uint32_t I2C_XFER_TO_MS  = 40;     // per transfer timeout
 static inline float ticksToDeg(uint16_t t12) { return (360.0f * (float)t12) / 4096.0f; }
 static inline int   wrapDist(int a, int b) { int d=b-a; while(d<-2048) d+=4096; while(d>=2048) d-=4096; return d; }
 
-// Simple EMA (no templates to avoid past compile errors)
+// Simple EMA (no templates)
 struct EMA {
   float y;
   float alpha;  // 0..1 (higher = snappier)
@@ -56,8 +56,6 @@ struct EMA {
 };
 
 // ===== Steer flip quieting =====
-// Call markSteerFlip() from your code at the instant you flip steer direction.
-// (If you don't call it, we simply never enter the quiet window.)
 static volatile uint32_t gSteerFlipMs = 0;
 static inline void markSteerFlip() { gSteerFlipMs = millis(); }  // expose for your use
 
@@ -66,8 +64,7 @@ static bool i2c_read16_retry(uint8_t addr, uint8_t reg, uint16_t& out) {
   for (uint8_t attempt = 0; attempt < I2C_RETRIES; ++attempt) {
     Wire.beginTransmission(addr);
     Wire.write(reg);
-    // 'false' => repeated start
-    if (Wire.endTransmission(false) != 0) { delay(1); continue; }
+    if (Wire.endTransmission(false) != 0) { delay(1); continue; } // repeated start
 
     int n = Wire.requestFrom((int)addr, 2, (int)true); // stop=true
     if (n == 2) {
@@ -97,7 +94,6 @@ static uint16_t lastGoodRaw = 0;
 static bool     haveGood    = false;
 static unsigned long lastPrint = 0;
 
-// ===== setup/loop =====
 void setup() {
   Serial.begin(115200);
   delay(150);
@@ -139,7 +135,7 @@ void loop() {
     readOK = as5600_read_raw(raw);
     if (readOK) { lastGoodRaw = raw; haveGood = true; }
   } else {
-    // In quiet zone: reuse last-good value (no bus traffic during motor surge)
+    // In quiet zone: reuse last-good value
     if (haveGood) { raw = lastGoodRaw; readOK = true; }
   }
 
@@ -186,6 +182,5 @@ void loop() {
        markSteerFlip();
 
    That starts a QUIET_MS-long window where we reuse the last good angle instead of
-   talking to the I²C bus. This avoids transient NACKs and keeps your serial/web output
-   smooth through the surge. Tune QUIET_MS at the top if needed.
+   talking to the I²C bus. Tune QUIET_MS at the top if needed.
 */

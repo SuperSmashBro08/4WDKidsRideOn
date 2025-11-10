@@ -1,19 +1,22 @@
-// ============ MyApp.ino (V 3.3.6 RAW + Steering Control, single-UART) ============
+// ============ MyApp.ino (V 3.3.7 RAW + Steering Control, single-UART, S-prefixed console) ============
 //
 // - RAW snapshot line every ~30 ms (S1/T1/S2/T2/FNR)
 // - ESP32 angle stream over the SAME UART (Serial2) via OtaUpdater hook
-//   expected line: "AS,<raw>,<deg>"
+//   expected line from ESP32: "AS,<raw>,<deg>"
 // - Motor driver: BTS7960-style on pins 15..18 (LPWM/RPWM/L_EN/R_EN)
 // - 20 kHz PWM for quiet steering drive
 // - OTA + console share Serial2; non-OTA lines are delegated to this sketch via hook
 //
-// If you want USB prints too:  LOG usb   or   LOG both   on the USB serial.
+// Notes
+// - We only consume: PING, VERSION, and AS,<raw>,<deg>. Everything else returns false so
+//   the flasher sees HELLO/BEGIN/L .../END.
+// - Every log line that goes to the ESP32 console is forced to start with "S ".
+//
+// ------------------------------------------------------------------------------------------------------
 
 #ifndef ENABLE_TEENSY_BINARY_TELEM
 #define ENABLE_TEENSY_BINARY_TELEM 0
 #endif
-
-struct TelemetryPayload;
 
 #include <Arduino.h>
 #include <stdarg.h>
@@ -31,7 +34,7 @@ struct TelemetryPayload;
 #endif
 
 // ---------- App identity ----------
-#define APP_FW_VERSION   "V 3.3.7"
+#define APP_FW_VERSION   "V 3.3.8"
 
 // ---------- Blink ----------
 #define LED_PIN          13
@@ -43,7 +46,7 @@ struct TelemetryPayload;
 // ---------- IO pins ----------
 static constexpr uint8_t PIN_FWD    = 10;
 static constexpr uint8_t PIN_REV    = 11;
-static constexpr uint8_t PIN_POT_S1 = 14;  // steering analog
+static constexpr uint8_t PIN_POT_S1 = 14;  // steering analog (your pot)
 static constexpr uint8_t PIN_POT_T1 = 27;  // throttle analog
 static constexpr uint8_t PIN_RC_S   = 4;   // RC steer PWM in
 static constexpr uint8_t PIN_RC_T   = 5;   // RC throttle PWM in
@@ -56,82 +59,19 @@ static constexpr int   ADC_MAX  = 4095;
 enum class LogSink : uint8_t { OTA, USB, BOTH };
 static LogSink g_logSink = LogSink::OTA;   // OTA-only by default (avoid dupes)
 
+// Force every line sent to ESP32 console to start with "S "
 static void LOG_raw(const char* s){
-  if (g_logSink==LogSink::OTA || g_logSink==LogSink::BOTH) OtaConsole::printf("%s", s);
+  const bool alreadyS = (s && s[0]=='S' && s[1]==' ');
+  if (g_logSink==LogSink::OTA || g_logSink==LogSink::BOTH){
+    if (alreadyS) OtaConsole::printf("%s", s);
+    else          OtaConsole::printf("S %s", s);
+  }
   if (g_logSink==LogSink::USB || g_logSink==LogSink::BOTH) Serial.print(s);
 }
 static void SLOGF(const char* fmt, ...){
   char buf[256];
   va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
   LOG_raw(buf);
-}
-
-// ---------- Binary telemetry packet (to ESP32) ----------
-static constexpr uint8_t TELEM_MAGIC0   = 0xA5;
-static constexpr uint8_t TELEM_MAGIC1   = 0x5A;
-static constexpr uint8_t TELEM_VERSION  = 1;
-
-enum TelemetryFlags : uint16_t {
-  TELEM_FLAG_INHIBIT     = 1u << 0,
-  TELEM_FLAG_RC_ACTIVE   = 1u << 1,
-  TELEM_FLAG_FNR_FAULT   = 1u << 2,
-  TELEM_FLAG_ANGLE_FRESH = 1u << 3,
-};
-
-struct __attribute__((packed)) TelemetryPayload {
-  uint16_t seq;
-  uint32_t millis;
-  uint16_t flags;
-  uint16_t s1;
-  uint16_t t1;
-  int16_t  s2_us;
-  int16_t  t2_us;
-  int16_t  s2_map;
-  int16_t  t2_map;
-  uint16_t as_raw;
-  int16_t  as_deg_centi;
-  uint8_t  gear;
-  uint8_t  steer_target;
-  uint8_t  steer_state;
-  uint8_t  reserved;
-  int16_t  steer_err_centi;
-};
-
-struct __attribute__((packed)) TelemetryPacket {
-  uint8_t           magic0;
-  uint8_t           magic1;
-  uint8_t           version;
-  uint8_t           length;
-  TelemetryPayload  payload;
-};
-
-static_assert(sizeof(TelemetryPayload) <= 64, "Telemetry payload too large");
-
-static uint16_t g_telemSeq = 0;
-
-static inline int16_t toCenti(float v){
-  float scaled = v * 100.0f;
-  if (scaled >= 0.0f) scaled += 0.5f;
-  else                scaled -= 0.5f;
-  long val = (long)scaled;
-  if (val > INT16_MAX) val = INT16_MAX;
-  if (val < INT16_MIN) val = INT16_MIN;
-  return (int16_t)val;
-}
-
-static void emitTelemetry(const TelemetryPayload& payload){
-#if ENABLE_TEENSY_BINARY_TELEM
-  if (OtaUpdater::inProgress()) return;
-  TelemetryPacket pkt{};
-  pkt.magic0  = TELEM_MAGIC0;
-  pkt.magic1  = TELEM_MAGIC1;
-  pkt.version = TELEM_VERSION;
-  pkt.length  = sizeof(TelemetryPayload);
-  pkt.payload = payload;
-  Serial2.write(reinterpret_cast<const uint8_t*>(&pkt), sizeof(pkt));
-#else
-  (void)payload;
-#endif
 }
 
 // ================= NAMESPACE =================
@@ -193,60 +133,126 @@ static void sampleFnr(){
 
 } // namespace MM
 
-// ======== ESP32 angle stream over Serial2 via OtaUpdater hook ========
+// ======= Angle stream (from ESP32) + helpers ==================================
+// The order matters: globals first, then helpers. This avoids "not declared"/linker errors.
 static volatile uint16_t g_as_raw = 0;
 static volatile float    g_as_deg = NAN;
 static volatile uint32_t g_as_ms  = 0;
 
+// Forward decls WITHOUT defaults (avoid duplicate default-arg warnings)
+static inline bool angleFresh(uint32_t maxAgeMs);
+static bool angleSnapshot(uint16_t& rawOut, float& degOut);
+
+// Only consume three strings so the OTA protocol gets through.
 extern "C" bool OtaUserHandleLine(const char* line) {
-  // Expect: "AS,<raw>,<deg>" from ESP32
-  if (!line || line[0] != 'A' || line[1] != 'S' || line[2] != ',') return false;
-  const char* p = line + 3;
-  const char* comma = strchr(p, ',');
-  if (!comma) return false;
+  if (!line || !*line) return false;
 
-  uint16_t raw = (uint16_t)strtoul(p, nullptr, 10);
-  float deg = atof(comma + 1);
+  // Buttons in the ESP32 web UI:
+  if (strcmp(line, "PING") == 0)    { Serial2.println("PONG"); return true; }
+  if (strcmp(line, "VERSION") == 0) {
+    Serial2.print("FW "); Serial2.println(APP_FW_VERSION);
+    Serial2.println("FLASHERX READY");
+    return true;
+  }
 
-  noInterrupts();
-  g_as_raw = raw;
-  g_as_deg = deg;
-  g_as_ms  = millis();
-  interrupts();
-  return true;
+  // Angle packets coming from ESP32
+  if (line[0]=='A' && line[1]=='S' && line[2]==',') {
+    const char* p = line + 3;
+    const char* comma = strchr(p, ','); if (!comma) return false;
+    uint16_t raw = (uint16_t)strtoul(p, nullptr, 10);
+    float    deg = atof(comma + 1);
+    noInterrupts(); g_as_raw=raw; g_as_deg=deg; g_as_ms=millis(); interrupts();
+    return true;
+  }
+
+  return false; // everything else is protocol traffic (HELLO, BEGIN, L..., END)
 }
-static inline bool angleFresh(uint32_t maxAgeMs=200){
+
+static inline bool angleFresh(uint32_t maxAgeMs) {
   uint32_t age = millis() - g_as_ms;
   return (g_as_ms != 0) && (age <= maxAgeMs) && !isnan(g_as_deg);
 }
-
-static bool angleSnapshot(uint16_t& rawOut, float& degOut){
-  uint16_t raw;
-  float deg;
-  uint32_t stamp;
-  noInterrupts();
-  raw = g_as_raw;
-  deg = g_as_deg;
-  stamp = g_as_ms;
-  interrupts();
+static bool angleSnapshot(uint16_t& rawOut, float& degOut) {
+  uint16_t raw; float deg; uint32_t stamp;
+  noInterrupts(); raw=g_as_raw; deg=g_as_deg; stamp=g_as_ms; interrupts();
   if (stamp == 0 || isnan(deg)) return false;
-  uint32_t age = millis() - stamp;
-  if (age > 200) return false;
-  rawOut = raw;
-  degOut = deg;
-  return true;
+  if ((millis() - stamp) > 200)  return false;
+  rawOut = raw; degOut = deg; return true;
 }
 
-// ======== Steering controller in a namespace (prevents auto-proto issues) ========
+// ======= Telemetry (optional binary to ESP32) ==================================
+static inline int16_t toCenti(float v){
+  float scaled = v * 100.0f;
+  scaled += (scaled >= 0.0f) ? 0.5f : -0.5f;
+  long val = (long)scaled;
+  if (val > INT16_MAX) val = INT16_MAX;
+  if (val < INT16_MIN) val = INT16_MIN;
+  return (int16_t)val;
+}
+
+#if ENABLE_TEENSY_BINARY_TELEM
+static constexpr uint8_t TELEM_MAGIC0   = 0xA5;
+static constexpr uint8_t TELEM_MAGIC1   = 0x5A;
+static constexpr uint8_t TELEM_VERSION  = 1;
+
+enum TelemetryFlags : uint16_t {
+  TELEM_FLAG_INHIBIT     = 1u << 0,
+  TELEM_FLAG_RC_ACTIVE   = 1u << 1,
+  TELEM_FLAG_FNR_FAULT   = 1u << 2,
+  TELEM_FLAG_ANGLE_FRESH = 1u << 3,
+};
+
+struct __attribute__((packed)) TelemetryPayload {
+  uint16_t seq;
+  uint32_t millis;
+  uint16_t flags;
+  uint16_t s1;
+  uint16_t t1;
+  int16_t  s2_us;
+  int16_t  t2_us;
+  int16_t  s2_map;
+  int16_t  t2_map;
+  uint16_t as_raw;
+  int16_t  as_deg_centi;
+  uint8_t  gear;
+  uint8_t  steer_target;
+  uint8_t  steer_state;
+  uint8_t  reserved;
+  int16_t  steer_err_centi;
+};
+
+struct __attribute__((packed)) TelemetryPacket {
+  uint8_t           magic0;
+  uint8_t           magic1;
+  uint8_t           version;
+  uint8_t           length;
+  TelemetryPayload  payload;
+};
+
+static uint16_t g_telemSeq = 0;
+
+static void emitTelemetry(const TelemetryPayload& payload){
+  if (OtaUpdater::inProgress()) return;
+  TelemetryPacket pkt{};
+  pkt.magic0  = TELEM_MAGIC0;
+  pkt.magic1  = TELEM_MAGIC1;
+  pkt.version = TELEM_VERSION;
+  pkt.length  = sizeof(TelemetryPayload);
+  pkt.payload = payload;
+  Serial2.write(reinterpret_cast<const uint8_t*>(&pkt), sizeof(pkt));
+}
+#endif // ENABLE_TEENSY_BINARY_TELEM
+
+// ======== Steering controller ==================================================
 namespace Steer {
-  // From your calibration
+  // Calibration
   static const float STEER_LEFT_DEG   = 129.07f;
   static const float STEER_RIGHT_DEG  = 201.97f;
   static const float STEER_CENTER_DEG = (STEER_LEFT_DEG + STEER_RIGHT_DEG) * 0.5f;
   static const float STEER_TOL_DEG    = 1.5f;
   static const float KP_PWM_PER_DEG   = 6.0f;
 
-  // Decide target from S1 raw bins (tune quickly from RAW prints)
+  // Decide target from S1 raw bins
   static const uint16_t S1_LEFT_MAX   = 1600;  // S1 ≤ this => Left
   static const uint16_t S1_RIGHT_MIN  = 2400;  // S1 ≥ this => Right
 
@@ -280,8 +286,7 @@ namespace Steer {
   }
 
   static void setMotor(int pwmSigned){
-    int mag = pwmSigned;
-    if (mag < 0) mag = -mag;
+    int mag = pwmSigned; if (mag < 0) mag = -mag;
     if (mag > 0 && mag < PWM_MIN) mag = PWM_MIN;
     if (mag > PWM_MAX) mag = PWM_MAX;
 
@@ -331,7 +336,7 @@ namespace Steer {
     Target tgt = pickTarget(s1raw);
     float  tgtDeg = targetDegFor(tgt);
 
-    if (!::angleFresh()){
+    if (!::angleFresh(200)){
       setMotor(0);
       if (g_ss != State::NoAngle) enter(State::NoAngle, "no-angle");
       g_lastErrDeg = 0.0f;
@@ -411,15 +416,15 @@ void setup(){
   attachInterrupt(digitalPinToInterrupt(PIN_RC_T), isrRcThrottle, CHANGE);
 
   Serial.begin(115200);
-  Serial2.begin(230400);
+  Serial2.begin(230400);                  // Teensy OTA/console UART
 
-  // Bring up OTA on Serial2 (used also for console & app hook)
+  // Bring up OTA on Serial2 BEFORE enabling console chatter
   OtaUpdater::begin(Serial2, 230400);
   OtaUpdater::setAppVersion(APP_FW_VERSION);
 
   Serial.println("[MyApp] boot");
-  delay(1200);                 // allow early noise to pass
-  OtaConsole::begin(Serial2);  // logs to ESP32 (/console)
+  delay(1200);                            // allow early noise to pass
+  OtaConsole::begin(Serial2);             // logs to ESP32 (/console)
   OtaConsole::setEnabled(true);
 
   // Motor driver init
@@ -442,15 +447,13 @@ void loop(){
   // OTA tick (console will be force-muted by the OTA module on HELLO)
   OtaUpdater::tick();
 
-  // ~33 Hz sampling tick (RAW stream + telemetry)
+  // ~33 Hz sampling tick (RAW stream + optional binary telemetry)
   static uint32_t t_sample=0;
   const uint32_t nowUs = micros();
   if (nowUs - t_sample >= 30000){ // ~30ms
     t_sample = nowUs;
-    const uint32_t nowMs = millis();
 
     uint32_t rcS_last_us, rcT_last_us;
-
     // Copy RC widths atomically
     noInterrupts();
     g_s2_us = rcS_width_us;
@@ -459,7 +462,7 @@ void loop(){
     rcT_last_us = rcT_last_update_us;
     interrupts();
 
-    // Sample raw
+    // Sample raw and FNR
     sampleAnalog();
     sampleFnr();
 
@@ -469,18 +472,6 @@ void loop(){
     uint16_t as_raw = 0;
     float    as_deg = 0.0f;
     const bool haveAngle = angleSnapshot(as_raw, as_deg);
-    const int16_t as_deg_centi = haveAngle ? toCenti(as_deg) : INT16_MIN;
-    const int16_t steer_err_centi = haveAngle ? toCenti(Steer::lastErrorDeg()) : INT16_MIN;
-
-    uint16_t flags = 0;
-    if (haveAngle) flags |= TELEM_FLAG_ANGLE_FRESH;
-    if (g_fnr == FNR_FAULT) flags |= TELEM_FLAG_FNR_FAULT;
-
-    static constexpr uint32_t RC_STALE_US = 250000; // 250 ms
-    const bool rcFresh = ((uint32_t)(nowUs - rcS_last_us) <= RC_STALE_US) &&
-                         ((uint32_t)(nowUs - rcT_last_us) <= RC_STALE_US);
-    if (rcFresh) flags |= TELEM_FLAG_RC_ACTIVE;
-
 #if RAW_MIRROR_MODE
     SLOGF("RAW S1=%u  T1=%u  S2_us=%d(%d)  T2_us=%d(%d)  AS=%u(%d)  FNR=%s\r\n",
           (unsigned)g_s1,
@@ -488,30 +479,41 @@ void loop(){
           (int)g_s2_us, (int)s2_map,
           (int)g_t2_us, (int)t2_map,
           (unsigned)(haveAngle ? as_raw : 0u),
-          (int)as_deg_centi,
+          (int)(haveAngle ? toCenti(as_deg) : INT16_MIN),
           fnrWord(g_fnr));
 #endif
 
-    TelemetryPayload telem{};
-    telem.flags           = flags;
-    telem.s1              = g_s1;
-    telem.t1              = g_t1;
-    telem.s2_us           = g_s2_us;
-    telem.t2_us           = g_t2_us;
-    telem.s2_map          = s2_map;
-    telem.t2_map          = t2_map;
-    telem.as_raw          = haveAngle ? as_raw : 0u;
-    telem.as_deg_centi    = as_deg_centi;
-    telem.gear            = static_cast<uint8_t>(g_fnr);
-    telem.steer_target    = static_cast<uint8_t>(Steer::lastTarget());
-    telem.steer_state     = static_cast<uint8_t>(Steer::state());
-    telem.reserved        = 0;
-    telem.steer_err_centi = steer_err_centi;
+#if ENABLE_TEENSY_BINARY_TELEM
+    // Compose and emit binary telemetry when not flashing
     if (!OtaUpdater::inProgress()){
-      telem.seq    = ++g_telemSeq;
-      telem.millis = nowMs;
+      static uint16_t g_telemSeq = 0;
+      static constexpr uint32_t RC_STALE_US = 250000; // 250 ms
+      const bool rcFresh = ((uint32_t)(nowUs - rcS_last_us) <= RC_STALE_US) &&
+                           ((uint32_t)(nowUs - rcT_last_us) <= RC_STALE_US);
+
+      TelemetryPayload telem{};
+      telem.seq              = ++g_telemSeq;
+      telem.millis           = millis();
+      telem.flags            = 0;
+      if (haveAngle) telem.flags |= TELEM_FLAG_ANGLE_FRESH;
+      if (g_fnr == FNR_FAULT) telem.flags |= TELEM_FLAG_FNR_FAULT;
+      if (rcFresh) telem.flags |= TELEM_FLAG_RC_ACTIVE;
+      telem.s1               = g_s1;
+      telem.t1               = g_t1;
+      telem.s2_us            = g_s2_us;
+      telem.t2_us            = g_t2_us;
+      telem.s2_map           = s2_map;
+      telem.t2_map           = t2_map;
+      telem.as_raw           = haveAngle ? as_raw : 0u;
+      telem.as_deg_centi     = haveAngle ? toCenti(as_deg) : INT16_MIN;
+      telem.gear             = static_cast<uint8_t>(g_fnr);
+      telem.steer_target     = 0; // filled if/when needed
+      telem.steer_state      = 0; // filled if/when needed
+      telem.reserved         = 0;
+      telem.steer_err_centi  = INT16_MIN;
       emitTelemetry(telem);
     }
+#endif
   }
 
   // ~50 Hz steering control loop
