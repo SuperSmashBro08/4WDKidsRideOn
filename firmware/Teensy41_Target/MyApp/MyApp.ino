@@ -1,17 +1,14 @@
-// ============ MyApp.ino  (V 3.4.0 • RAW + Steering Control, single-UART, S-prefixed console) ============
+// ============ MyApp.ino (V 3.4.1 RAW + Steering Control, 1/3 bucket mapping) ============
 //
-// - RAW snapshot line every ~30 ms: S RAW S1/T1/S2/T2/FNR plus AS angle (when fresh)
+// - RAW snapshot line every ~30 ms (S1/T1/S2/T2/FNR/AS)
 // - ESP32 angle stream over the SAME UART (Serial2) via OtaUpdater hook
 //   expected line from ESP32: "AS,<raw>,<deg>"
-// - Motor driver: BTS7960-style on pins 15..18 (LPWM/RPWM/L_EN/R_EN)
+// - Motor driver: BTS7960-style on pins 15..18 (LPWM/RPWM/L_EN/R_EN) => J7-6..J7-3
 // - 20 kHz PWM for quiet steering drive
-// - OTA + console share Serial2; non-OTA lines are delegated here via OtaUserHandleLine()
+// - Clamp + soften near physical limits; absolute “no push past hard cushion”
+// - Left/Center/Right selection by splitting BOTH Steering1 (analog) and Steering2 (RC) into equal thirds
 //
-// We ONLY consume: PING, VERSION, and AS,<raw>,<deg>. Everything else returns false so
-// the flasher sees HELLO/BEGIN/L .../END.
-// Every log line that goes to the ESP32 console is forced to start with "S ".
-//
-// ------------------------------------------------------------------------------------------------------
+// ------------------------------------------------------------------------------------------
 
 #ifndef ENABLE_TEENSY_BINARY_TELEM
 #define ENABLE_TEENSY_BINARY_TELEM 0
@@ -25,7 +22,6 @@
 #include "OtaUpdater.h"
 #include "OtaConsole.h"
 
-// Teensy compatibility shims (if building outside Teensyduino contexts)
 #ifndef IRAM_ATTR
 #define IRAM_ATTR
 #endif
@@ -34,7 +30,7 @@
 #endif
 
 // ---------- App identity ----------
-#define APP_FW_VERSION   "V 3.4.0"
+#define APP_FW_VERSION   "V 3.4.1"
 
 // ---------- Blink ----------
 #define LED_PIN          13
@@ -43,13 +39,27 @@
 // ---------- Raw-mirror mode switch ----------
 #define RAW_MIRROR_MODE  1   // keep raw stream on
 
+// ================== USER-TUNABLE RANGES FOR 1/3 SPLIT ==================
+// Steering1 (analog pot) nominal full-scale:
+static constexpr uint16_t S1_MIN = 420;
+static constexpr uint16_t S1_MAX = 2870;
+
+// Steering2 (RC PWM width in microseconds) nominal full-scale:
+static constexpr uint16_t RC_MIN_US = 1000;
+static constexpr uint16_t RC_MID_US = 1500;
+static constexpr uint16_t RC_MAX_US = 2000;
+static constexpr uint16_t RC_DB_US  = 20;   // deadband around mid for mapping helpers
+
+// If you want the center third slightly tighter (optional), shrink it a bit:
+// e.g. 0.10 = shrink by 10% (wider left/right thirds). 0.00 = exact equal thirds.
+static constexpr float CENTER_BAND_SHRINK_PCT = 0.00f;
+// =======================================================================
+
 // ---------- IO pins ----------
-static constexpr uint8_t PIN_FWD    = 10;  // F/N/R inputs (active LOW with pullups)
+static constexpr uint8_t PIN_FWD    = 10;
 static constexpr uint8_t PIN_REV    = 11;
-
-static constexpr uint8_t PIN_POT_S1 = 14;  // steering analog (your pot, used to pick target bucket)
+static constexpr uint8_t PIN_POT_S1 = 14;  // steering analog
 static constexpr uint8_t PIN_POT_T1 = 27;  // throttle analog
-
 static constexpr uint8_t PIN_RC_S   = 4;   // RC steer PWM in
 static constexpr uint8_t PIN_RC_T   = 5;   // RC throttle PWM in
 
@@ -83,16 +93,12 @@ namespace MM {
 enum FnrState : uint8_t { FNR_NEU=0, FNR_FWD=1, FNR_REV=2, FNR_FAULT=3 };
 static FnrState g_fnr = FNR_NEU;
 static inline const char* fnrWord(FnrState s){
-  switch(s){
-    case FNR_FWD: return "forward";
-    case FNR_REV: return "reverse";
-    case FNR_NEU: return "neutral";
-    default:      return "fault";
-  }
+  switch(s){ case FNR_FWD: return "forward"; case FNR_REV: return "reverse";
+             case FNR_NEU: return "neutral"; default: return "fault"; }
 }
 
 // ===== Live values =====
-static uint16_t g_s1=0, g_t1=0;                  // raw analog (S1 steering pot, T1 throttle pot)
+static uint16_t g_s1=0, g_t1=0;                  // raw analog
 static volatile uint32_t rcS_rise_us=0, rcS_last_update_us=0;
 static volatile uint16_t rcS_width_us=1500;
 static volatile uint32_t rcT_rise_us=0, rcT_last_update_us=0;
@@ -100,8 +106,6 @@ static volatile uint16_t rcT_width_us=1500;
 static int16_t  g_s2_us=1500, g_t2_us=1500;      // copied atomically each tick
 
 // ===== RC PWM capture (interrupt) =====
-static constexpr uint16_t RC_MIN_US=1000, RC_MID_US=1500, RC_MAX_US=2000, RC_DB_US=20;
-
 static void IRAM_ATTR isrRcSteer(){
   uint32_t now=micros();
   if(digitalReadFast(PIN_RC_S)) rcS_rise_us=now;
@@ -117,13 +121,15 @@ static void IRAM_ATTR isrRcThrottle(){
 static inline int16_t clamp_i16(int32_t v, int16_t lo, int16_t hi){ if(v<lo) return lo; if(v>hi) return hi; return (int16_t)v; }
 
 static inline int16_t mapRcSteer_us_to_1000(int16_t us){
-  if(us<RC_MIN_US) us=RC_MIN_US; if(us>RC_MAX_US) us=RC_MAX_US;
-  int32_t x=(int32_t)us-RC_MID_US; if (abs(x)<=RC_DB_US) return 0;
+  int16_t u = us;
+  if(u<RC_MIN_US) u=RC_MIN_US; if(u>RC_MAX_US) u=RC_MAX_US;
+  int32_t x=(int32_t)u-RC_MID_US; if (abs(x)<=RC_DB_US) return 0;
   return clamp_i16((x*1000)/(RC_MAX_US-RC_MID_US), -1000, 1000);
 }
 static inline int16_t mapRcThr_us_to_1000(int16_t us){
-  if(us<RC_MIN_US) us=RC_MIN_US; if(us>RC_MAX_US) us=RC_MAX_US;
-  int32_t out=((int32_t)us-RC_MIN_US)*1000/(RC_MAX_US-RC_MIN_US);
+  int16_t u=us;
+  if(u<RC_MIN_US) u=RC_MIN_US; if(u>RC_MAX_US) u=RC_MAX_US;
+  int32_t out=((int32_t)u-RC_MIN_US)*1000/(RC_MAX_US-RC_MIN_US);
   if(out<0)out=0; if(out>1000)out=1000; return (int16_t)out;
 }
 
@@ -140,20 +146,18 @@ static void sampleFnr(){
 } // namespace MM
 
 // ======= Angle stream (from ESP32) + helpers ==================================
-// Globals updated from ESP32 CSV "AS,<raw>,<deg>" lines
-static volatile uint16_t g_as_raw = 0;   // 0..4095
-static volatile float    g_as_deg = NAN; // degrees 0..360 wrap (ESP32 smoothed)
-static volatile uint32_t g_as_ms  = 0;   // last update ms
+// The order matters: globals first, then helpers.
+static volatile uint16_t g_as_raw = 0;
+static volatile float    g_as_deg = NAN;
+static volatile uint32_t g_as_ms  = 0;
 
-// Forward decls WITHOUT defaults (avoid duplicate default-arg warnings)
+// Forward decls WITHOUT defaults
 static inline bool angleFresh(uint32_t maxAgeMs);
 static bool angleSnapshot(uint16_t& rawOut, float& degOut);
 
-// Hook from OtaUpdater: return true if this line is fully handled here.
 extern "C" bool OtaUserHandleLine(const char* line) {
   if (!line || !*line) return false;
 
-  // Buttons in the ESP32 web UI:
   if (strcmp(line, "PING") == 0)    { Serial2.println("PONG"); return true; }
   if (strcmp(line, "VERSION") == 0) {
     Serial2.print("FW "); Serial2.println(APP_FW_VERSION);
@@ -161,36 +165,27 @@ extern "C" bool OtaUserHandleLine(const char* line) {
     return true;
   }
 
-  // Angle packets coming from ESP32: "AS,<raw>,<deg>"
+  // Angle packets from ESP32: AS,<raw>,<deg>
   if (line[0]=='A' && line[1]=='S' && line[2]==',') {
     const char* p = line + 3;
-    const char* comma1 = strchr(p, ','); if (!comma1) return false;
+    const char* comma = strchr(p, ','); if (!comma) return false;
     uint16_t raw = (uint16_t)strtoul(p, nullptr, 10);
-    float    deg = atof(comma1 + 1);
-    if (raw <= 4095 && isfinite(deg)) {
-      noInterrupts(); g_as_raw=raw; g_as_deg=deg; g_as_ms=millis(); interrupts();
-    }
+    float    deg = atof(comma + 1);
+    noInterrupts(); g_as_raw=raw; g_as_deg=deg; g_as_ms=millis(); interrupts();
     return true;
   }
-
-  // Everything else is protocol traffic (HELLO/BEGIN/L.../END)
-  return false;
+  return false; // allow flasher traffic (HELLO/BEGIN/L.../END)
 }
 
 static inline bool angleFresh(uint32_t maxAgeMs) {
-  uint32_t stamp, age;
-  noInterrupts(); stamp = g_as_ms; interrupts();
-  if (stamp == 0) return false;
-  age = millis() - stamp;
-  float d; noInterrupts(); d = g_as_deg; interrupts();
-  return (age <= maxAgeMs) && !isnan(d);
+  uint32_t age = millis() - g_as_ms;
+  return (g_as_ms != 0) && (age <= maxAgeMs) && !isnan(g_as_deg);
 }
-
 static bool angleSnapshot(uint16_t& rawOut, float& degOut) {
   uint16_t raw; float deg; uint32_t stamp;
   noInterrupts(); raw=g_as_raw; deg=g_as_deg; stamp=g_as_ms; interrupts();
   if (stamp == 0 || isnan(deg)) return false;
-  if ((millis() - stamp) > 250)  return false; // ~4 cycles old @100ms ESP32 feed
+  if ((millis() - stamp) > 200)  return false;
   rawOut = raw; degOut = deg; return true;
 }
 
@@ -208,78 +203,80 @@ static inline int16_t toCenti(float v){
 static constexpr uint8_t TELEM_MAGIC0   = 0xA5;
 static constexpr uint8_t TELEM_MAGIC1   = 0x5A;
 static constexpr uint8_t TELEM_VERSION  = 1;
-
 enum TelemetryFlags : uint16_t {
   TELEM_FLAG_INHIBIT     = 1u << 0,
   TELEM_FLAG_RC_ACTIVE   = 1u << 1,
   TELEM_FLAG_FNR_FAULT   = 1u << 2,
   TELEM_FLAG_ANGLE_FRESH = 1u << 3,
 };
-
 struct __attribute__((packed)) TelemetryPayload {
-  uint16_t seq;
-  uint32_t millis;
-  uint16_t flags;
-  uint16_t s1;
-  uint16_t t1;
-  int16_t  s2_us;
-  int16_t  t2_us;
-  int16_t  s2_map;
-  int16_t  t2_map;
-  uint16_t as_raw;
-  int16_t  as_deg_centi;
-  uint8_t  gear;
-  uint8_t  steer_target;
-  uint8_t  steer_state;
-  uint8_t  reserved;
-  int16_t  steer_err_centi;
+  uint16_t seq; uint32_t millis; uint16_t flags; uint16_t s1; uint16_t t1;
+  int16_t s2_us; int16_t t2_us; int16_t s2_map; int16_t t2_map;
+  uint16_t as_raw; int16_t as_deg_centi; uint8_t gear; uint8_t steer_target;
+  uint8_t steer_state; uint8_t reserved; int16_t steer_err_centi;
 };
-
 struct __attribute__((packed)) TelemetryPacket {
-  uint8_t           magic0;
-  uint8_t           magic1;
-  uint8_t           version;
-  uint8_t           length;
-  TelemetryPayload  payload;
+  uint8_t magic0, magic1, version, length; TelemetryPayload payload;
 };
-
 static uint16_t g_telemSeq = 0;
-
 static void emitTelemetry(const TelemetryPayload& payload){
-  if (OtaUpdater::inProgress()) return; // respect OTA silence
-  TelemetryPacket pkt{};
-  pkt.magic0  = TELEM_MAGIC0;
-  pkt.magic1  = TELEM_MAGIC1;
-  pkt.version = TELEM_VERSION;
-  pkt.length  = sizeof(TelemetryPayload);
-  pkt.payload = payload;
+  if (OtaUpdater::inProgress()) return;
+  TelemetryPacket pkt{}; pkt.magic0=0xA5; pkt.magic1=0x5A; pkt.version=1;
+  pkt.length=sizeof(TelemetryPayload); pkt.payload=payload;
   Serial2.write(reinterpret_cast<const uint8_t*>(&pkt), sizeof(pkt));
 }
-#endif // ENABLE_TEENSY_BINARY_TELEM
+#endif
+
+// ====================== CONFIGURE YOUR LIMITS HERE ======================
+// Choose one format and fill the numbers from your photo.
+// Set AS_LIMITS_SOURCE to 0 if your photo has RAW ticks (0..4095), or 1 if it has degrees.
+#define AS_LIMITS_SOURCE   1   // 0 = RAW ticks, 1 = degrees
+
+// If using RAW ticks from photo:
+#define AS_LEFT_RAW_PHOTO   1465
+#define AS_RIGHT_RAW_PHOTO  2300
+#define AS_CENTER_RAW_PHOTO ((AS_LEFT_RAW_PHOTO+AS_RIGHT_RAW_PHOTO)/2)
+
+// If using degrees from photo:
+#define AS_LEFT_DEG_PHOTO    129.00f
+#define AS_RIGHT_DEG_PHOTO   202.00f
+#define AS_CENTER_DEG_PHOTO  ((AS_LEFT_DEG_PHOTO+AS_RIGHT_DEG_PHOTO)*0.5f)
+
+// Soft/hard cushions (safety margins near stops)
+static const float LIMIT_SOFT_CUSHION_DEG = 2.5f;   // taper effort inside this band
+static const float LIMIT_HARD_CUSHION_DEG = 0.8f;   // absolute “do not push past”
+// =======================================================================
+
+static inline float ticksToDeg_u12(uint16_t t12){ return (360.0f * (float)t12) / 4096.0f; }
 
 // ======== Steering controller ==================================================
 namespace Steer {
-  // Calibration (YOU CAN TUNE THESE)
-  static const float STEER_LEFT_DEG   = 129.07f;
-  static const float STEER_RIGHT_DEG  = 201.97f;
-  static const float STEER_CENTER_DEG = (STEER_LEFT_DEG + STEER_RIGHT_DEG) * 0.5f;
-  static const float STEER_TOL_DEG    = 1.5f;      // hold window
-  static const float KP_PWM_PER_DEG   = 6.0f;      // proportional gain
 
-  // Decide target from S1 raw bins (YOUR POT BUCKETS)
-  static const uint16_t S1_LEFT_MAX   = 1600;      // S1 ≤ this => Left
-  static const uint16_t S1_RIGHT_MIN  = 2400;      // S1 ≥ this => Right
+// Build final left/right/center degrees from RAW or DEG inputs:
+#if AS_LIMITS_SOURCE == 0
+  static const float STEER_LEFT_DEG   = ticksToDeg_u12((uint16_t)AS_LEFT_RAW_PHOTO);
+  static const float STEER_RIGHT_DEG  = ticksToDeg_u12((uint16_t)AS_RIGHT_RAW_PHOTO);
+  static const float STEER_CENTER_DEG = ticksToDeg_u12((uint16_t)AS_CENTER_RAW_PHOTO);
+#else
+  static const float STEER_LEFT_DEG   = AS_LEFT_DEG_PHOTO;
+  static const float STEER_RIGHT_DEG  = AS_RIGHT_DEG_PHOTO;
+  static const float STEER_CENTER_DEG = AS_CENTER_DEG_PHOTO;
+#endif
 
-  // BTS7960 pins
-  static const uint8_t PIN_MOT_LPWM = 15;  // J7-6
-  static const uint8_t PIN_MOT_RPWM = 16;  // J7-5
-  static const uint8_t PIN_MOT_LEN  = 17;  // J7-4
-  static const uint8_t PIN_MOT_REN  = 18;  // J7-3
+  static const float STEER_TOL_DEG    = 1.5f;     // hold window
+  static const float KP_PWM_PER_DEG   = 6.0f;     // proportional gain
+
+  // BTS7960 pins (J7 header)
+  static const uint8_t PIN_MOT_LPWM = 15;  // J7-6  Steer L_PWM
+  static const uint8_t PIN_MOT_RPWM = 16;  // J7-5  Steer R_PWM
+  static const uint8_t PIN_MOT_LEN  = 17;  // J7-4  Steer L_EN
+  static const uint8_t PIN_MOT_REN  = 18;  // J7-3  Steer R_EN
 
   static const uint32_t STEER_PWM_FREQ = 20000; // 20 kHz
   static const int      PWM_MAX         = 255;   // 8-bit
   static const int      PWM_MIN         = 60;
 
+  // ======= 1/3 BUCKET SELECTION =======
   enum class Target : uint8_t { Left, Center, Right };
   enum class State  : uint8_t { Idle, ToLeft, ToCenter, ToRight, Holding, NoAngle };
 
@@ -288,16 +285,39 @@ namespace Steer {
   static float  g_lastErrDeg = 0.0f;
   static float  g_lastTgtDeg = STEER_CENTER_DEG;
 
-  static inline Target pickTarget(uint16_t s1raw){
-    if (s1raw <= S1_LEFT_MAX)  return Target::Left;
-    if (s1raw >= S1_RIGHT_MIN) return Target::Right;
-    return Target::Center;
+  // Equal thirds with optional center shrink
+  static inline void thirds_u16(uint16_t minv, uint16_t maxv, uint16_t& L_hi, uint16_t& C_hi){
+    const uint32_t span = (uint32_t)maxv - (uint32_t)minv;
+    uint32_t third = span / 3u;
+    uint32_t cshrink = (uint32_t)((float)third * CENTER_BAND_SHRINK_PCT * 0.5f);
+    uint32_t b1 = (uint32_t)minv + third - cshrink;         // end of Left
+    uint32_t b2 = (uint32_t)minv + (2u*third) + cshrink;    // end of Center
+    if (b1 <= minv) b1 = (uint32_t)minv + 1;
+    if (b2 <= b1)   b2 = b1 + 1;
+    if (b2 > maxv)  b2 = maxv;
+    L_hi = (uint16_t)b1;
+    C_hi = (uint16_t)b2;
   }
+
+  static inline Target pickTargetS1(uint16_t s1raw){
+    uint16_t Lhi, Chi; thirds_u16(S1_MIN, S1_MAX, Lhi, Chi);
+    if (s1raw < Lhi)       return Target::Left;
+    else if (s1raw < Chi)  return Target::Center;
+    else                   return Target::Right;
+  }
+
+  static inline Target pickTargetS2_us(uint16_t rc_us){
+    uint16_t Lhi, Chi; thirds_u16(RC_MIN_US, RC_MAX_US, Lhi, Chi);
+    if (rc_us < Lhi)       return Target::Left;
+    else if (rc_us < Chi)  return Target::Center;
+    else                   return Target::Right;
+  }
+
   static inline float targetDegFor(Target t){
     switch (t){
-      case Target::Left:  return STEER_LEFT_DEG;
-      case Target::Right: return STEER_RIGHT_DEG;
-      default:            return STEER_CENTER_DEG;
+      case Target::Left:   return STEER_LEFT_DEG;
+      case Target::Right:  return STEER_RIGHT_DEG;
+      default:             return STEER_CENTER_DEG;
     }
   }
 
@@ -337,22 +357,71 @@ namespace Steer {
   static inline float lastErrorDeg(){ return g_lastErrDeg; }
   static inline float lastTargetDeg(){ return g_lastTgtDeg; }
 
-  static void begin(){
-    pinMode(PIN_MOT_LPWM, OUTPUT);
-    pinMode(PIN_MOT_RPWM, OUTPUT);
-    pinMode(PIN_MOT_LEN,  OUTPUT);
-    pinMode(PIN_MOT_REN,  OUTPUT);
-    analogWriteFrequency(PIN_MOT_LPWM, STEER_PWM_FREQ);
-    analogWriteFrequency(PIN_MOT_RPWM, STEER_PWM_FREQ);
-    analogWriteResolution(8);
-    setMotor(0);
+  // Safety helpers
+  static inline float clampTarget(float wantDeg){
+    const float lo = STEER_LEFT_DEG  + LIMIT_HARD_CUSHION_DEG;
+    const float hi = STEER_RIGHT_DEG - LIMIT_HARD_CUSHION_DEG;
+    if (wantDeg < lo) return lo;
+    if (wantDeg > hi) return hi;
+    return wantDeg;
+  }
+  static inline int softenNearStops(float curDeg, int pwmSigned){
+    if (curDeg <= STEER_LEFT_DEG + LIMIT_SOFT_CUSHION_DEG && pwmSigned < 0){
+      float span = LIMIT_SOFT_CUSHION_DEG - LIMIT_HARD_CUSHION_DEG;
+      float x = (curDeg - (STEER_LEFT_DEG + LIMIT_HARD_CUSHION_DEG)) / span; // 0..1
+      if (x < 0) return 0; if (x > 1) x = 1;
+      return (int)(pwmSigned * x);
+    }
+    if (curDeg >= STEER_RIGHT_DEG - LIMIT_SOFT_CUSHION_DEG && pwmSigned > 0){
+      float span = LIMIT_SOFT_CUSHION_DEG - LIMIT_HARD_CUSHION_DEG;
+      float x = ((STEER_RIGHT_DEG - LIMIT_HARD_CUSHION_DEG) - curDeg) / span; // 0..1
+      if (x < 0) return 0; if (x > 1) x = 1;
+      return (int)(pwmSigned * x);
+    }
+    return pwmSigned;
   }
 
-  static void tick(uint16_t s1raw){
-    Target tgt = pickTarget(s1raw);
-    float  tgtDeg = targetDegFor(tgt);
+static void begin(){
+  pinMode(PIN_MOT_LPWM, OUTPUT);
+  pinMode(PIN_MOT_RPWM, OUTPUT);
+  pinMode(PIN_MOT_LEN,  OUTPUT);
+  pinMode(PIN_MOT_REN,  OUTPUT);
+  analogWriteFrequency(PIN_MOT_LPWM, STEER_PWM_FREQ);
+  analogWriteFrequency(PIN_MOT_RPWM, STEER_PWM_FREQ);
+  analogWriteResolution(8);
+  setMotor(0);
 
-    if (!::angleFresh(220)){             // slight slack vs angleSnapshot's 250ms
+  // Existing limits banner
+  SLOGF("S LIM left=%.2f center=%.2f right=%.2f  soft=%.2f hard=%.2f\r\n",
+        (double)STEER_LEFT_DEG, (double)STEER_CENTER_DEG, (double)STEER_RIGHT_DEG,
+        (double)LIMIT_SOFT_CUSHION_DEG, (double)LIMIT_HARD_CUSHION_DEG);
+
+  // 🟢 New section: show 1/3 bucket edges for S1 (analog) and S2 (RC)
+  {
+    uint16_t s1L, s1C; thirds_u16(S1_MIN, S1_MAX, s1L, s1C);
+    uint16_t s2L, s2C; thirds_u16(RC_MIN_US, RC_MAX_US, s2L, s2C);
+    SLOGF("S S1 thirds: [%u..%u) | [%u..%u) | [%u..%u]\r\n",
+          (unsigned)S1_MIN, (unsigned)s1L,
+          (unsigned)s1L,    (unsigned)s1C,
+          (unsigned)s1C,    (unsigned)S1_MAX);
+    SLOGF("S S2 thirds: [%u..%u) | [%u..%u) | [%u..%u]\r\n",
+          (unsigned)RC_MIN_US, (unsigned)s2L,
+          (unsigned)s2L,       (unsigned)s2C,
+          (unsigned)s2C,       (unsigned)RC_MAX_US);
+  }
+}
+
+
+  // Select target by S1 thirds (primary), but if you want to drive from RC thirds instead,
+  // change the call below from pickTargetS1(MM::g_s1) to pickTargetS2_us(MM::g_s2_us).
+  static void tick(uint16_t s1raw){
+    Target tgt = pickTargetS1(s1raw);
+    // Alternative: Target tgt = pickTargetS2_us((uint16_t)MM::g_s2_us);
+
+    float  wantDeg = targetDegFor(tgt);
+    float  tgtDeg  = clampTarget(wantDeg);
+
+    if (!::angleFresh(220)){
       setMotor(0);
       if (g_ss != State::NoAngle) enter(State::NoAngle, "no-angle");
       g_lastErrDeg = 0.0f;
@@ -365,10 +434,17 @@ namespace Steer {
     float err = tgtDeg - cur;                      // +err => need to move RIGHT
     int   pwm = (int)(KP_PWM_PER_DEG * err);
 
+    // Absolute “no push past” at hard cushions
+    if ((cur <= STEER_LEFT_DEG  + LIMIT_HARD_CUSHION_DEG) && (pwm < 0))  pwm = 0;
+    if ((cur >= STEER_RIGHT_DEG - LIMIT_HARD_CUSHION_DEG) && (pwm > 0))  pwm = 0;
+
+    // Taper effort inside soft cushions
+    pwm = softenNearStops(cur, pwm);
+
     g_lastErrDeg = err;
     g_lastTgtDeg = tgtDeg;
 
-    if (fabsf(err) <= STEER_TOL_DEG){
+    if (fabsf(err) <= STEER_TOL_DEG || pwm == 0){
       setMotor(0);
       if (g_ss != State::Holding || tgt != g_lastTgt){
         const char* where = (tgt==Target::Left)?"left":(tgt==Target::Right)?"right":"center";
@@ -388,7 +464,28 @@ namespace Steer {
   }
 } // namespace Steer
 
-// ===== USB commands (simple: LOG sink only) =====
+// ---- Live calibration helper (optional) ----
+static float g_calLeftDeg   = Steer::STEER_LEFT_DEG;
+static float g_calRightDeg  = Steer::STEER_RIGHT_DEG;
+static float g_calCenterDeg = Steer::STEER_CENTER_DEG;
+
+static bool angleNow(float& degOut){
+  uint16_t raw; float deg;
+  if (!angleSnapshot(raw, deg)) return false;
+  degOut = deg; return true;
+}
+static void calShow(){
+  SLOGF("S CAL left=%.2f center=%.2f right=%.2f\r\n",
+        (double)g_calLeftDeg, (double)g_calCenterDeg, (double)g_calRightDeg);
+  SLOGF("S CAL paste:\r\n"
+        "  static const float STEER_LEFT_DEG   = %.2ff;\r\n"
+        "  static const float STEER_RIGHT_DEG  = %.2ff;\r\n"
+        "  static const float STEER_CENTER_DEG = %.2ff;\r\n",
+        (double)g_calLeftDeg, (double)g_calRightDeg,
+        (double)((g_calLeftDeg+g_calRightDeg)*0.5f));
+}
+
+// ===== USB commands (simple: LOG + CAL) =====
 static void handleUsbCommandsOnce() {
   static String line;
   while (Serial.available()){
@@ -406,8 +503,24 @@ static void handleUsbCommandsOnce() {
           else if(a1=="usb"){ g_logSink=LogSink::USB; Serial.println("[MyApp] log sink: USB"); }
           else if(a1=="both"){ g_logSink=LogSink::BOTH; Serial.println("[MyApp] log sink: BOTH"); }
           else Serial.println("usage: LOG ota|usb|both");
+        } else if (verb=="CAL") {
+          // CAL L | C | R | SHOW
+          if (a1=="L") {
+            float d; if (angleNow(d)) { g_calLeftDeg=d; calShow(); }
+            else SLOGF("S CAL no angle yet\r\n");
+          } else if (a1=="C") {
+            float d; if (angleNow(d)) { g_calCenterDeg=d; calShow(); }
+            else SLOGF("S CAL no angle yet\r\n");
+          } else if (a1=="R") {
+            float d; if (angleNow(d)) { g_calRightDeg=d; calShow(); }
+            else SLOGF("S CAL no angle yet\r\n");
+          } else if (a1=="SHOW") {
+            calShow();
+          } else {
+            Serial.println("usage: CAL L|C|R|SHOW");
+          }
         } else {
-          Serial.println("Unknown. Try: LOG ota|usb|both");
+          Serial.println("Unknown. Try: LOG ota|usb|both  |  CAL L|C|R|SHOW");
         }
       }
       line="";
@@ -491,7 +604,6 @@ void loop(){
 
 #if RAW_MIRROR_MODE
     if (haveAngle) {
-      // prints to ESP32 UI (starts with "S "), and USB sees the same text
       SLOGF("S RAW S1=%u  T1=%u  S2_us=%d(%d)  T2_us=%d(%d)  AS=%u(%.2f)  FNR=%s\r\n",
             (unsigned)g_s1, (unsigned)g_t1,
             (int)g_s2_us, (int)s2_map,
@@ -499,7 +611,6 @@ void loop(){
             (unsigned)as_raw, (double)as_deg,
             fnrWord(g_fnr));
     } else {
-      // hide angle completely when not fresh
       SLOGF("S RAW S1=%u  T1=%u  S2_us=%d(%d)  T2_us=%d(%d)  AS=---  FNR=%s\r\n",
             (unsigned)g_s1, (unsigned)g_t1,
             (int)g_s2_us, (int)s2_map,
@@ -509,8 +620,8 @@ void loop(){
 #endif
 
 #if ENABLE_TEENSY_BINARY_TELEM
-    // Compose and emit binary telemetry when not flashing
     if (!OtaUpdater::inProgress()){
+      static uint16_t g_telemSeq = 0;
       static constexpr uint32_t RC_STALE_US = 250000; // 250 ms
       const bool rcFresh = ((uint32_t)(nowUs - rcS_last_us) <= RC_STALE_US) &&
                            ((uint32_t)(nowUs - rcT_last_us) <= RC_STALE_US);
@@ -531,8 +642,8 @@ void loop(){
       telem.as_raw           = haveAngle ? as_raw : 0u;
       telem.as_deg_centi     = haveAngle ? toCenti(as_deg) : INT16_MIN;
       telem.gear             = static_cast<uint8_t>(g_fnr);
-      telem.steer_target     = 0; // filled if/when needed
-      telem.steer_state      = 0; // filled if/when needed
+      telem.steer_target     = 0;
+      telem.steer_state      = 0;
       telem.reserved         = 0;
       telem.steer_err_centi  = INT16_MIN;
       emitTelemetry(telem);
@@ -544,7 +655,7 @@ void loop(){
   static uint32_t t_ctrl = 0;
   if (micros() - t_ctrl >= 20000){
     t_ctrl = micros();
-    Steer::tick(MM::g_s1);  // decide target by S1-buckets, then close on AS angle
+    Steer::tick(MM::g_s1);              // or Steer::tick(MM::g_s2_us) if you want RC thirds to decide
   }
 
   // Blink

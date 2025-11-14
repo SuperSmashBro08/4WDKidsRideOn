@@ -1,0 +1,49 @@
+Teensy 4.1 Ride-On Pin Assignments
+Steering (J7)
+Teensy Pin	Label / Function	Board Header	Motor Controller Label
+Pin 15	Steer LPWM	J7-6	Steer L_PWM
+Pin 16	Steer RPWM	J7-5	Steer R_PWM
+Pin 17	Steer L_EN	J7-4	Steer L_EN
+Pin 18	Steer R_EN	J7-3	Steer R_EN
+
+Front Motors (J2)
+Teensy Pin	Label / Function	Board Header	Motor Controller Label
+Pin 19	Front R_EN	J2-3	Front R_EN
+Pin 20	Front L_EN	J2-4	Front L_EN
+Pin 21	Front L_PWM	J2-5	Front L_PWM
+Pin 22	Front R_PWM	J2-6	Front R_PWM
+
+Rear Motors (J1)
+Teensy Pin	Label / Function	Board Header	Motor Controller Label
+Pin 23	Rear R_EN	J1-3	Rear R_EN
+Pin 24	Rear L_EN	J1-4	Rear L_EN
+Pin 25	Rear L_PWM	J1-5	Rear L_PWM
+Pin 26	Rear R_PWM	J1-6	Rear R_PWM
+
+
+Direction Switch (Shift Lever)
+Teensy Pin	Label / Function	Board Header	Motor Controller 
+Pin 10	Forward		
+Pin 11	Reverse		
+
+ESP32 Link (UART for OTA/Telnet)
+Teensy Pin	Label / Function	Board Header	Motor Controller
+Pin 7	RX2 (to ESP32 TX)		
+Pin 8	TX2 (to ESP32 RX)		
+
+Pots (Child Controls)
+Teensy Pin	Label / Function	Board Header	Motor Controller
+Pin 27	Foot Pedal (Throttle1)		
+Pin 3	Steering Wheel (Steering1)		
+
+Remote Override (RC Receiver)
+Teensy Pin	Label / Function	Board Header	Motor Controller
+Pin 5	Steering2		
+Pin 4	Throttle2		
+
+Gearbox Encoder (AMT-102V)
+Teensy Pin	Label / Function	Board Header	Motor Controller
+Pin 2	Encoder X		
+Pin 1	Encoder B		
+Pin 0	Encoder A		
+
