@@ -1,4 +1,4 @@
-// ============ MyApp.ino (V 3.6.0) ============
+// ============ MyApp.ino  ============
 //
 // Features:
 // - RAW snapshot line every ~30 ms: S1/T1/S2/T2/FNR/AS + throttle levels (both sources, raw view)
@@ -51,7 +51,7 @@
 #endif
 
 // ---------- App identity ----------
-#define APP_FW_VERSION   "V 3.6.0"
+#define APP_FW_VERSION   "V 3.6.1"
 
 // ---------- Blink ----------
 #define LED_PIN          13
@@ -365,7 +365,7 @@ static bool g_t2Armed = false;
 #define STEER_DRIVE_ENABLE 0
 
 // Disable drive motors until we're ready
-#define DRIVE_ENABLE       0
+#define DRIVE_ENABLE       1
 
 // ---- Neutral helpers ----
 static inline bool isT2Neutral(uint16_t us){
