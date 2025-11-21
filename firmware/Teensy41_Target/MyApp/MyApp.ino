@@ -1,11 +1,18 @@
-// ============ MyApp.ino (V 3.5.5) ============
+// ============ MyApp.ino (V 3.6.0) ============
 //
 // Features:
-// - RAW snapshot line every ~30 ms: S1/T1/S2/T2/FNR/AS/Steer + throttle levels
+// - RAW snapshot line every ~30 ms: S1/T1/S2/T2/FNR/AS + throttle levels (both sources, raw view)
+// - STEER line: steering target (L/C/R), current angle, steer source, throttle source, drive ON/OFF
+// - THR line: effective throttle source (T1/T2) and speed level OFF/LOW/MED/HIGH
+// - DRIVE logic:
+//      • FNR = neutral → drive OFF
+//      • FNR = forward → M1/M2 drive forward at OFF/LOW/MED/HIGH
+//      • FNR = reverse → M1/M2 drive reverse at OFF/LOW/MED/HIGH
+//      • Only the active throttle source (ThrSrc) affects drive speed
 // - ESP32 angle stream over Serial2 via OtaUpdater hook
 //   expected line from ESP32: "AS,<raw>,<deg>"
 // - Steering motor driver: BTS7960 on pins 15..18 (LPWM/RPWM/L_EN/R_EN)
-// - Front (M1) and Rear (M2) drive BTS7960 on pins 19..26 (currently forced OFF)
+// - Front (M1) and Rear (M2) drive BTS7960 on pins 19..26
 // - Steering selection by thirds (S1 or S2):
 //      S1: 420..2870 (left/center/right thirds)
 //      S2: 1000..2000 µs (left/center/right thirds)
@@ -20,7 +27,6 @@
 //      • After handover, T2 must pass through neutral to arm
 //      • When S2 and T2 both sit near neutral (~1500 ± 40 µs) for 10 s
 //        → auto-return to S1/T1, regardless of S1/T1 state
-// - RAW line shows steering current angle and target angle + target label LEFT/CENTER/RIGHT
 // - Steering motor drive is disabled by default (STEER_DRIVE_ENABLE=0)
 //
 // =============================================
@@ -45,7 +51,7 @@
 #endif
 
 // ---------- App identity ----------
-#define APP_FW_VERSION   "V 3.5.5"
+#define APP_FW_VERSION   "V 3.6.0"
 
 // ---------- Blink ----------
 #define LED_PIN          13
@@ -358,6 +364,9 @@ static bool g_t2Armed = false;
 // Disable steering motor drive until we’re ready
 #define STEER_DRIVE_ENABLE 0
 
+// Disable drive motors until we're ready
+#define DRIVE_ENABLE       0
+
 // ---- Neutral helpers ----
 static inline bool isT2Neutral(uint16_t us){
   return (us >= (T2_NEUTRAL_CTR_US - T2_NEUTRAL_DB_US)) &&
@@ -383,6 +392,16 @@ static inline int8_t classifyThrottleSigned(int16_t vSigned, int16_t deadbandAbs
   if (a <= THR_LVL1_MAX_01)    return 1; // Low
   if (a <= THR_LVL2_MAX_01)    return 2; // Med
   return 3;                               // High
+}
+
+static inline const char* thrLevelWord(int8_t lvl){
+  switch (lvl){
+    case 0:  return "OFF";
+    case 1:  return "LOW";
+    case 2:  return "MED";
+    case 3:  return "HIGH";
+    default: return "?";
+  }
 }
 
 // ======== Steering controller ==================================================
@@ -576,7 +595,7 @@ namespace Steer {
     const char* srcSteer = (g_steerSrc==SteerSrc::S1) ? "S1" : "S2";
     const char* srcThr   = (g_thrSrc  ==ThrSrc::T1)   ? "T1" : "T2";
 
-    // Steer debug (no explicit error printed)
+    // Steer debug
     SLOGF("S STEER tgt=%s(%.2f) cur=%.2f src=%s thr=%s drive=%s\r\n",
           (tgt==Target::Left)?"L":(tgt==Target::Right)?"R":"C",
           (double)tgtDeg, (double)cur, srcSteer, srcThr,
@@ -601,6 +620,90 @@ namespace Steer {
     g_lastTgt = tgt;
   }
 } // namespace Steer
+
+// ======== Drive controller (M1 + M2, uses FNR + effective throttle) ===========
+namespace Drive {
+
+  // Simple speed table for OFF/LOW/MED/HIGH (0..3)
+  static inline int levelToPwm(int8_t lvl){
+    switch (lvl){
+      case 1: return 80;   // LOW
+      case 2: return 140;  // MED
+      case 3: return 200;  // HIGH
+      default: return 0;   // OFF
+    }
+  }
+
+  struct MotorPins {
+    uint8_t enL;
+    uint8_t enR;
+    uint8_t pwmL;
+    uint8_t pwmR;
+  };
+
+  static const MotorPins M1 = { PIN_M1_L_EN, PIN_M1_R_EN, PIN_M1_L_PWM, PIN_M1_R_PWM };
+  static const MotorPins M2 = { PIN_M2_L_EN, PIN_M2_R_EN, PIN_M2_L_PWM, PIN_M2_R_PWM };
+
+  static void setOneMotor(const MotorPins& m, int pwmSigned){
+#if !DRIVE_ENABLE
+    // Safety: always force OFF when drive disabled
+    digitalWrite(m.enL, LOW);
+    digitalWrite(m.enR, LOW);
+    analogWrite (m.pwmL, 0);
+    analogWrite (m.pwmR, 0);
+    (void)pwmSigned;
+    return;
+#endif
+    int mag = pwmSigned;
+    if (mag < 0) mag = -mag;
+    if (mag > 255) mag = 255;
+
+    if (pwmSigned > 0){
+      // Forward
+      digitalWrite(m.enL, HIGH);
+      digitalWrite(m.enR, LOW);
+      analogWrite (m.pwmL, mag);
+      analogWrite (m.pwmR, 0);
+    } else if (pwmSigned < 0){
+      // Reverse
+      digitalWrite(m.enL, LOW);
+      digitalWrite(m.enR, HIGH);
+      analogWrite (m.pwmL, 0);
+      analogWrite (m.pwmR, mag);
+    } else {
+      // OFF
+      digitalWrite(m.enL, LOW);
+      digitalWrite(m.enR, LOW);
+      analogWrite (m.pwmL, 0);
+      analogWrite (m.pwmR, 0);
+    }
+  }
+
+  // Apply based on FNR + effective throttle level
+  static void apply(MM::FnrState fnr, int8_t effLevel){
+    int pwmMag = levelToPwm(effLevel);
+    int pwmSigned = 0;
+
+    if (fnr == MM::FNR_FWD){
+      pwmSigned = +pwmMag;
+    } else if (fnr == MM::FNR_REV){
+      pwmSigned = -pwmMag;
+    } else {
+      pwmSigned = 0; // neutral or fault
+    }
+
+    setOneMotor(M1, pwmSigned);
+    setOneMotor(M2, pwmSigned);
+
+    const char* fnrStr = MM::fnrWord(fnr);
+    const char* srcThr = (g_thrSrc==ThrSrc::T1) ? "T1" : "T2";
+
+    SLOGF("S DRIVE fnr=%s src=%s lvl=%s pwm=%d enable=%s\r\n",
+          fnrStr, srcThr, thrLevelWord(effLevel), pwmMag,
+          DRIVE_ENABLE ? "ON" : "OFF");
+  }
+
+} // namespace Drive
 
 // ---- USB commands (optional) ----
 static void handleUsbCommandsOnce() {
@@ -691,7 +794,7 @@ void setup(){
   Steer::begin();
 
   // Boot banner
-  SLOGF("MyApp RAW+STEER FW=%s  (blink=%d ms)\r\n", APP_FW_VERSION, BLINK_MS);
+  SLOGF("MyApp RAW+STEER+DRIVE FW=%s  (blink=%d ms)\r\n", APP_FW_VERSION, BLINK_MS);
   SLOGF("BOOT_PINS fwd=%d rev=%d (0=LOW,1=HIGH)\r\n",
         (int)digitalRead(PIN_FWD), (int)digitalRead(PIN_REV));
 #if ENABLE_TEENSY_BINARY_TELEM
@@ -715,7 +818,7 @@ void loop(){
   // OTA tick
   OtaUpdater::tick();
 
-  // ~33 Hz sampling / logic tick
+  // ~33 Hz sampling / logic + drive tick
   static uint32_t t_sample=0;
   const uint32_t nowUs = micros();
   if (nowUs - t_sample >= 30000){ // ~30ms
@@ -743,9 +846,9 @@ void loop(){
     const int16_t t2_signed = mapRcThrSigned_us_to_1000(g_t2_us);
     g_t2Level = classifyThrottleSigned(t2_signed, THR_LVL1_MAX_01 / 10); // tiny DB, mostly from isT2Neutral
 
-    // If T2 not armed yet, treat as Off
+    // If T2 not armed yet and is the active throttle, treat as Off for drive
     if (g_thrSrc == ThrSrc::T2 && !g_t2Armed){
-      g_t2Level = 0;
+      // keep g_t2Level for RAW display, but effective level will be forced to 0 below
     }
 
     // ---- Control handover logic ----
@@ -794,56 +897,59 @@ void loop(){
       g_rcNeutralStartMs = 0;
     }
 
+    // Effective throttle (only selected source actually drives)
+    int8_t effThrLevel = 0;
+    const char* effSrcStr = (g_thrSrc==ThrSrc::T1) ? "T1" : "T2";
+
+    if (g_thrSrc == ThrSrc::T1){
+      effThrLevel = g_t1Level;
+    } else {
+      // T2: if not armed, force OFF for drive
+      effThrLevel = g_t2Armed ? g_t2Level : 0;
+    }
+
     // Maps for visualization
     const int16_t s2_map = mapRcSteer_us_to_1000(g_s2_us);
     const int16_t t2_map = mapRcThr_us_to_1000(g_t2_us);
 
-    // Angle snapshot
+    // Angle snapshot for RAW
     uint16_t as_raw = 0;
     float    as_deg = 0.0f;
-    const bool haveAngle = angleSnapshot(as_raw, as_deg);
-
-    // Steering target deg + label
-    const float steerTgtDeg = Steer::lastTargetDeg();
-    const char* steerTgtLabel;
-    switch (Steer::lastTarget()) {
-      case Steer::Target::Left:   steerTgtLabel = "LEFT";   break;
-      case Steer::Target::Right:  steerTgtLabel = "RIGHT";  break;
-      default:                    steerTgtLabel = "CENTER"; break;
-    }
+    bool     haveAngle = angleSnapshot(as_raw, as_deg);
 
 #if RAW_MIRROR_MODE
     if (haveAngle) {
       SLOGF(
         "S RAW S1=%u  T1=%u(%d,Lv%d)  S2_us=%d(%d)  T2_us=%d(%d,Lv%d)  "
-        "AS=%u(%.2f)  ST=cur=%.2f tgt=%s(%.2f)  FNR=%s  SRC=%s/%s %s\r\n",
+        "AS=%u(%.2f)  FNR=%s\r\n",
         (unsigned)g_s1,
         (unsigned)g_t1, (int)t1_map, (int)g_t1Level,
         (int)g_s2_us, (int)s2_map,
         (int)g_t2_us, (int)t2_map, (int)g_t2Level,
         (unsigned)as_raw, (double)as_deg,
-        (double)as_deg, steerTgtLabel, (double)steerTgtDeg,
-        fnrWord(g_fnr),
-        (g_steerSrc==SteerSrc::S1)?"S1":"S2",
-        (g_thrSrc  ==ThrSrc::T1)  ?"T1":"T2",
-        (g_thrSrc==ThrSrc::T2 ? (g_t2Armed?"ARMED":"UNARMED") : "")
+        fnrWord(g_fnr)
       );
     } else {
       SLOGF(
         "S RAW S1=%u  T1=%u(%d,Lv%d)  S2_us=%d(%d)  T2_us=%d(%d,Lv%d)  "
-        "AS=---  ST=cur=--- tgt=%s(%.2f)  FNR=%s  SRC=%s/%s %s\r\n",
+        "AS=---  FNR=%s\r\n",
         (unsigned)g_s1,
         (unsigned)g_t1, (int)t1_map, (int)g_t1Level,
         (int)g_s2_us, (int)s2_map,
         (int)g_t2_us, (int)t2_map, (int)g_t2Level,
-        steerTgtLabel, (double)steerTgtDeg,
-        fnrWord(g_fnr),
-        (g_steerSrc==SteerSrc::S1)?"S1":"S2",
-        (g_thrSrc  ==ThrSrc::T1)  ?"T1":"T2",
-        (g_thrSrc==ThrSrc::T2 ? (g_t2Armed?"ARMED":"UNARMED") : "")
+        fnrWord(g_fnr)
       );
     }
+
+    // Throttle summary (effective source + level)
+    SLOGF("S THR src=%s lvl=%s t1Lv=%d t2Lv=%d t2Arm=%s\r\n",
+          effSrcStr, thrLevelWord(effThrLevel),
+          (int)g_t1Level, (int)g_t2Level,
+          (g_thrSrc==ThrSrc::T2 ? (g_t2Armed?"ARMED":"UNARMED") : "N/A"));
 #endif
+
+    // Apply drive outputs using FNR + effective throttle level
+    Drive::apply(g_fnr, effThrLevel);
   }
 
   // ~50 Hz steering control loop
