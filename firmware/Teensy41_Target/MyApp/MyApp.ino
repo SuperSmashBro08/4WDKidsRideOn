@@ -1,21 +1,29 @@
-// ============ MyApp.ino (V 3.5.0 RAW + Steering/Throttle source handover + thirds) ============
+// ============ MyApp.ino (V 3.5.5) ============
 //
-// - RAW snapshot line every ~30 ms (S1/T1/S2/T2/FNR/AS)
-// - ESP32 angle stream over the SAME UART (Serial2) via OtaUpdater hook
+// Features:
+// - RAW snapshot line every ~30 ms: S1/T1/S2/T2/FNR/AS/Steer + throttle levels
+// - ESP32 angle stream over Serial2 via OtaUpdater hook
 //   expected line from ESP32: "AS,<raw>,<deg>"
-// - Motor driver: BTS7960-style on pins 15..18 (LPWM/RPWM/L_EN/R_EN)
-// - 20 kHz PWM for quiet steering drive
-// - Steering selection by thirds (S1 or S2), per your ranges:
+// - Steering motor driver: BTS7960 on pins 15..18 (LPWM/RPWM/L_EN/R_EN)
+// - Front (M1) and Rear (M2) drive BTS7960 on pins 19..26 (currently forced OFF)
+// - Steering selection by thirds (S1 or S2):
 //      S1: 420..2870 (left/center/right thirds)
 //      S2: 1000..2000 µs (left/center/right thirds)
+// - Throttle shaping:
+//      • T1 pedal raw window: 1108 = Off, 3140 = Full
+//        - mapped 0..1000 only across [1108..3140]
+//        - <=30 in that normalized space = Off (Lv0), rest → Lv1/Lv2/Lv3
+//      • T2 RC: signed around 1500 µs, magnitude → Lv1/Lv2/Lv3
 // - Control source switching:
 //      • Default source: S1/T1
-//      • Hold T2 reverse (≤1200 µs) continuously for 3 s → switch to S2/T2
-//      • After handover, T2 throttle must pass through neutral (arm) before it takes effect
-//      • When BOTH T1 and T2 are neutral (deadbanded) for 10 s → switch back to S1/T1
-// - Motor drive is disabled (STEER_DRIVE_ENABLE=0) so we can verify targets/logic safely
+//      • Hold T2 reverse (≤1200 µs) for 3 s → switch to S2/T2
+//      • After handover, T2 must pass through neutral to arm
+//      • When S2 and T2 both sit near neutral (~1500 ± 40 µs) for 10 s
+//        → auto-return to S1/T1, regardless of S1/T1 state
+// - RAW line shows steering current angle and target angle + target label LEFT/CENTER/RIGHT
+// - Steering motor drive is disabled by default (STEER_DRIVE_ENABLE=0)
 //
-// ------------------------------------------------------------------------------------------------------
+// =============================================
 
 #ifndef ENABLE_TEENSY_BINARY_TELEM
 #define ENABLE_TEENSY_BINARY_TELEM 0
@@ -37,7 +45,7 @@
 #endif
 
 // ---------- App identity ----------
-#define APP_FW_VERSION   "V 3.5.0"
+#define APP_FW_VERSION   "V 3.5.5"
 
 // ---------- Blink ----------
 #define LED_PIN          13
@@ -47,20 +55,44 @@
 #define RAW_MIRROR_MODE  1   // keep raw stream on
 
 // ---------- IO pins ----------
+// Gear F/N/R switch inputs (active LOW with pullups)
 static constexpr uint8_t PIN_FWD    = 10;
 static constexpr uint8_t PIN_REV    = 11;
+
+// Steering 1 and Throttle 1 (analog)
 static constexpr uint8_t PIN_POT_S1 = 14;  // steering analog (wheel/pot)
 static constexpr uint8_t PIN_POT_T1 = 27;  // throttle analog (foot pedal)
+
+// RC steering/throttle (S2/T2) PWM inputs
 static constexpr uint8_t PIN_RC_S   = 4;   // RC steer PWM in (S2)
 static constexpr uint8_t PIN_RC_T   = 5;   // RC throttle PWM in (T2)
 
+// Steering BTS7960 (steer motor)
+static constexpr uint8_t PIN_STEER_LPWM = 15;  // J7-6
+static constexpr uint8_t PIN_STEER_RPWM = 16;  // J7-5
+static constexpr uint8_t PIN_STEER_LEN  = 17;  // J7-4
+static constexpr uint8_t PIN_STEER_REN  = 18;  // J7-3
+
+// Drive motor outputs (M1 Front, M2 Rear)
+// Front Motors (M1)
+static constexpr uint8_t PIN_M1_R_EN  = 19;  // J2-3  Front R_EN
+static constexpr uint8_t PIN_M1_L_EN  = 20;  // J2-4  Front L_EN
+static constexpr uint8_t PIN_M1_L_PWM = 21;  // J2-5  Front L_PWM
+static constexpr uint8_t PIN_M1_R_PWM = 22;  // J2-6  Front R_PWM
+
+// Rear Motors (M2)
+static constexpr uint8_t PIN_M2_R_EN  = 23;  // J1-3  Rear R_EN
+static constexpr uint8_t PIN_M2_L_EN  = 24;  // J1-4  Rear L_EN
+static constexpr uint8_t PIN_M2_L_PWM = 25;  // J1-5  Rear L_PWM
+static constexpr uint8_t PIN_M2_R_PWM = 26;  // J1-6  Rear R_PWM
+
 // ---------- ADC helpers ----------
-static constexpr float ADC_VREF = 3.3f;
-static constexpr int   ADC_MAX  = 4095;
+static constexpr float    ADC_VREF    = 3.3f;
+static constexpr int      ADC_MAX     = 4095;
 
 // ---------- Logging sink control ----------
 enum class LogSink : uint8_t { OTA, USB, BOTH };
-static LogSink g_logSink = LogSink::OTA;   // OTA-only by default (avoid dupes)
+static LogSink g_logSink = LogSink::OTA;   // OTA-only by default
 
 // Force every line sent to ESP32 console to start with "S "
 static void LOG_raw(const char* s){
@@ -77,7 +109,7 @@ static void SLOGF(const char* fmt, ...){
   LOG_raw(buf);
 }
 
-// ================= NAMESPACE =================
+// ================= NAMESPACE MM =================
 namespace MM {
 
 // ===== Gear / FNR =====
@@ -102,35 +134,80 @@ static constexpr uint16_t RC_MIN_US=1000, RC_MID_US=1500, RC_MAX_US=2000, RC_DB_
 static void IRAM_ATTR isrRcSteer(){
   uint32_t now=micros();
   if(digitalReadFast(PIN_RC_S)) rcS_rise_us=now;
-  else { uint32_t w=now-rcS_rise_us; if(w<=3000){ rcS_width_us=(uint16_t)w; rcS_last_update_us=now; } }
+  else {
+    uint32_t w=now-rcS_rise_us;
+    if(w<=3000){
+      rcS_width_us=(uint16_t)w;
+      rcS_last_update_us=now;
+    }
+  }
 }
 static void IRAM_ATTR isrRcThrottle(){
   uint32_t now=micros();
   if(digitalReadFast(PIN_RC_T)) rcT_rise_us=now;
-  else { uint32_t w=now-rcT_rise_us; if(w<=3000){ rcT_width_us=(uint16_t)w; rcT_last_update_us=now; } }
+  else {
+    uint32_t w=now-rcT_rise_us;
+    if(w<=3000){
+      rcT_width_us=(uint16_t)w;
+      rcT_last_update_us=now;
+    }
+  }
 }
 
 // ===== Convenience maps =====
-static inline int16_t clamp_i16(int32_t v, int16_t lo, int16_t hi){ if(v<lo) return lo; if(v>hi) return hi; return (int16_t)v; }
+static inline int16_t clamp_i16(int32_t v, int16_t lo, int16_t hi){
+  if(v<lo) return lo;
+  if(v>hi) return hi;
+  return (int16_t)v;
+}
 
 static inline int16_t mapRcSteer_us_to_1000(int16_t us){
-  if(us<RC_MIN_US) us=RC_MIN_US; if(us>RC_MAX_US) us=RC_MAX_US;
-  int32_t x=(int32_t)us-RC_MID_US; if (abs(x)<=RC_DB_US) return 0;
+  if(us<RC_MIN_US) us=RC_MIN_US;
+  if(us>RC_MAX_US) us=RC_MAX_US;
+  int32_t x=(int32_t)us-RC_MID_US;
+  if (abs(x)<=RC_DB_US) return 0;
   return clamp_i16((x*1000)/(RC_MAX_US-RC_MID_US), -1000, 1000);
 }
+
+// Throttle-2: raw-to-0..1000 (forward magnitude helper)
 static inline int16_t mapRcThr_us_to_1000(int16_t us){
-  if(us<RC_MIN_US) us=RC_MIN_US; if(us>RC_MAX_US) us=RC_MAX_US;
+  if(us<RC_MIN_US) us=RC_MIN_US;
+  if(us>RC_MAX_US) us=RC_MAX_US;
   int32_t out=((int32_t)us-RC_MIN_US)*1000/(RC_MAX_US-RC_MIN_US);
-  if(out<0)out=0; if(out>1000)out=1000; return (int16_t)out;
+  if(out<0)out=0;
+  if(out>1000)out=1000;
+  return (int16_t)out;
 }
 
-// A normalized view for T1 as 0..1000 (for neutral detection convenience)
+// Throttle-2: signed around 1500 µs: -1000 .. 0 .. +1000
+static inline int16_t mapRcThrSigned_us_to_1000(int16_t us){
+  if(us<RC_MIN_US) us=RC_MIN_US;
+  if(us>RC_MAX_US) us=RC_MAX_US;
+  int32_t x = (int32_t)us - RC_MID_US;
+  if (abs(x) <= RC_DB_US) return 0;
+  int32_t span = (RC_MAX_US - RC_MID_US);
+  int32_t v = (x * 1000) / span;
+  return clamp_i16(v, -1000, 1000);
+}
+
+// T1 raw window: 1108 (off) to 3140 (full)
+static constexpr uint16_t T1_MIN_RAW = 1108;
+static constexpr uint16_t T1_MAX_RAW = 3140;
+
+// T1 mapped to 0..1000 but only across [T1_MIN_RAW..T1_MAX_RAW]
 static inline int16_t mapT1_to_1000(uint16_t t1raw){
-  return (int16_t)((uint32_t)t1raw * 1000u / 4095u);
+  if (t1raw <= T1_MIN_RAW) return 0;
+  if (t1raw >= T1_MAX_RAW) return 1000;
+  uint32_t num = (uint32_t)(t1raw - T1_MIN_RAW) * 1000u;
+  uint32_t den = (uint32_t)(T1_MAX_RAW - T1_MIN_RAW);
+  return (int16_t)(num / den);
 }
 
 // ===== Samples =====
-static void sampleAnalog(){ g_s1=analogRead(PIN_POT_S1); g_t1=analogRead(PIN_POT_T1); }
+static void sampleAnalog(){
+  g_s1=analogRead(PIN_POT_S1);
+  g_t1=analogRead(PIN_POT_T1);
+}
 static void sampleFnr(){
   const bool fwd_low=(digitalRead(PIN_FWD)==LOW), rev_low=(digitalRead(PIN_REV)==LOW);
   if( fwd_low &&  rev_low) g_fnr=FNR_FAULT;
@@ -151,16 +228,28 @@ static bool angleSnapshot(uint16_t& rawOut, float& degOut);
 
 extern "C" bool OtaUserHandleLine(const char* line) {
   if (!line || !*line) return false;
-  if (strcmp(line, "PING") == 0)    { Serial2.println("PONG"); return true; }
-  if (strcmp(line, "VERSION") == 0) { Serial2.print("FW "); Serial2.println(APP_FW_VERSION); Serial2.println("FLASHERX READY"); return true; }
+  if (strcmp(line, "PING") == 0) {
+    Serial2.println("PONG");
+    return true;
+  }
+  if (strcmp(line, "VERSION") == 0) {
+    Serial2.print("FW "); Serial2.println(APP_FW_VERSION);
+    Serial2.println("FLASHERX READY");
+    return true;
+  }
 
   // Angle packets from ESP32: AS,<raw>,<deg>
   if (line[0]=='A' && line[1]=='S' && line[2]==',') {
     const char* p = line + 3;
-    const char* comma = strchr(p, ','); if (!comma) return false;
+    const char* comma = strchr(p, ',');
+    if (!comma) return false;
     uint16_t raw = (uint16_t)strtoul(p, nullptr, 10);
     float    deg = atof(comma + 1);
-    noInterrupts(); g_as_raw=raw; g_as_deg=deg; g_as_ms=millis(); interrupts();
+    noInterrupts();
+    g_as_raw=raw;
+    g_as_deg=deg;
+    g_as_ms=millis();
+    interrupts();
     return true;
   }
   return false;
@@ -172,15 +261,20 @@ static inline bool angleFresh(uint32_t maxAgeMs) {
 }
 static bool angleSnapshot(uint16_t& rawOut, float& degOut) {
   uint16_t raw; float deg; uint32_t stamp;
-  noInterrupts(); raw=g_as_raw; deg=g_as_deg; stamp=g_as_ms; interrupts();
+  noInterrupts();
+  raw=g_as_raw; deg=g_as_deg; stamp=g_as_ms;
+  interrupts();
   if (stamp == 0 || isnan(deg)) return false;
   if ((millis() - stamp) > 200)  return false;
-  rawOut = raw; degOut = deg; return true;
+  rawOut = raw;
+  degOut = deg;
+  return true;
 }
 
 // ======= Telemetry (optional binary to ESP32) ==================================
 static inline int16_t toCenti(float v){
-  float scaled = v * 100.0f; scaled += (scaled >= 0.0f) ? 0.5f : -0.5f;
+  float scaled = v * 100.0f;
+  scaled += (scaled >= 0.0f) ? 0.5f : -0.5f;
   long val = (long)scaled;
   if (val > INT16_MAX) val = INT16_MAX;
   if (val < INT16_MIN) val = INT16_MIN;
@@ -188,11 +282,11 @@ static inline int16_t toCenti(float v){
 }
 
 #if ENABLE_TEENSY_BINARY_TELEM
-// (unchanged binary telemetry types and emitTelemetry() … omit for brevity)
+// (binary telemetry omitted)
 #endif
 
 // ====================== LIMITS / THIRDS ======================
-#define AS_LIMITS_SOURCE   1   // 0 = RAW ticks, 1 = degrees  (keep degrees for now)
+#define AS_LIMITS_SOURCE   1   // 0 = RAW ticks, 1 = degrees
 #define AS_LEFT_RAW_PHOTO   1465
 #define AS_RIGHT_RAW_PHOTO  2300
 #define AS_CENTER_RAW_PHOTO ((AS_LEFT_RAW_PHOTO+AS_RIGHT_RAW_PHOTO)/2)
@@ -203,18 +297,24 @@ static inline int16_t toCenti(float v){
 static const float LIMIT_SOFT_CUSHION_DEG = 2.5f;
 static const float LIMIT_HARD_CUSHION_DEG = 0.8f;
 
-static inline float ticksToDeg_u12(uint16_t t12){ return (360.0f * (float)t12) / 4096.0f; }
+static inline float ticksToDeg_u12(uint16_t t12){
+  return (360.0f * (float)t12) / 4096.0f;
+}
 
-// ====================== CONTROL SOURCE / HANDOVER ======================
+// ====================== CONTROL SOURCE / THROTTLE LEVELS ======================
 enum class SteerSrc : uint8_t { S1, S2 };
 enum class ThrSrc   : uint8_t { T1, T2 };
 static SteerSrc g_steerSrc = SteerSrc::S1;   // default
 static ThrSrc   g_thrSrc   = ThrSrc::T1;     // default
 
-// Your S1 thirds (from you): 420..2870
+// 4-level throttle classification (0=Off,1=Low,2=Med,3=High)
+static int8_t g_t1Level = 0;   // always start OFF
+static int8_t g_t2Level = 0;   // always start OFF
+
+// Your S1 thirds: 420..2870
 static constexpr uint16_t S1_MIN = 420;
 static constexpr uint16_t S1_MAX = 2870;
-// S2 thirds (RC): 1000..2000 µs
+// S2 thirds: 1000..2000 µs
 static constexpr uint16_t S2_MIN = 1000;
 static constexpr uint16_t S2_MAX = 2000;
 
@@ -236,16 +336,54 @@ static uint32_t g_rcReverseStartMs = 0;
 // Neutral detection (deadbands)
 static constexpr uint16_t T2_NEUTRAL_DB_US   = 40;        // ~±40 µs around 1500
 static constexpr uint16_t T2_NEUTRAL_CTR_US  = 1500;
-static constexpr uint16_t T1_NEUTRAL_DB_MAP  = 30;        // 0..1000 scale
-// Auto-return timer when both are neutral
-static constexpr uint32_t AUTO_RETURN_MS     = 10000;     // 10 s
-static uint32_t g_bothNeutralStartMs = 0;
 
-// T2 throttle arming (must pass through neutral after handover)
+static constexpr uint16_t S2_NEUTRAL_DB_US   = 40;        // ~±40 µs around 1500 for steering
+static constexpr uint16_t S2_NEUTRAL_CTR_US  = 1500;
+
+// T1 "zero" deadband in T1 0..1000 space
+static constexpr int16_t  T1_NEUTRAL_DB_MAP = 30;         // small off deadband
+
+// Throttle level split points (magnitude in 0..1000)
+static constexpr int16_t  THR_LVL1_MAX_01 = 333;          // Low
+static constexpr int16_t  THR_LVL2_MAX_01 = 666;          // Med
+static constexpr int16_t  THR_LVL3_MAX_01 = 1000;         // High
+
+// Auto-return timer when S2 and T2 are neutral
+static constexpr uint32_t AUTO_RETURN_MS     = 10000;     // 10 s
+static uint32_t g_rcNeutralStartMs = 0;
+
+// T2 throttle arming
 static bool g_t2Armed = false;
 
-// Motor drive lockout until we’re ready
+// Disable steering motor drive until we’re ready
 #define STEER_DRIVE_ENABLE 0
+
+// ---- Neutral helpers ----
+static inline bool isT2Neutral(uint16_t us){
+  return (us >= (T2_NEUTRAL_CTR_US - T2_NEUTRAL_DB_US)) &&
+         (us <= (T2_NEUTRAL_CTR_US + T2_NEUTRAL_DB_US));
+}
+static inline bool isS2Neutral(uint16_t us){
+  return (us >= (S2_NEUTRAL_CTR_US - S2_NEUTRAL_DB_US)) &&
+         (us <= (S2_NEUTRAL_CTR_US + S2_NEUTRAL_DB_US));
+}
+
+// ---- Throttle level classification ----
+// Return 0..3 for Off/Low/Med/High
+static inline int8_t classifyThrottle01(int16_t v01, int16_t deadband){
+  if (v01 <= deadband)        return 0; // Off
+  if (v01 <= THR_LVL1_MAX_01) return 1; // Low
+  if (v01 <= THR_LVL2_MAX_01) return 2; // Med
+  return 3;                               // High
+}
+
+static inline int8_t classifyThrottleSigned(int16_t vSigned, int16_t deadbandAbs){
+  int16_t a = abs(vSigned);
+  if (a <= deadbandAbs)        return 0; // Off
+  if (a <= THR_LVL1_MAX_01)    return 1; // Low
+  if (a <= THR_LVL2_MAX_01)    return 2; // Med
+  return 3;                               // High
+}
 
 // ======== Steering controller ==================================================
 namespace Steer {
@@ -263,11 +401,11 @@ namespace Steer {
   static const float STEER_TOL_DEG    = 1.5f;     // hold window
   static const float KP_PWM_PER_DEG   = 6.0f;     // proportional gain
 
-  // BTS7960 pins
-  static const uint8_t PIN_MOT_LPWM = 15;  // J7-6
-  static const uint8_t PIN_MOT_RPWM = 16;  // J7-5
-  static const uint8_t PIN_MOT_LEN  = 17;  // J7-4
-  static const uint8_t PIN_MOT_REN  = 18;  // J7-3
+  // Use the global steering pins
+  static const uint8_t PIN_MOT_LPWM = PIN_STEER_LPWM;  // 15
+  static const uint8_t PIN_MOT_RPWM = PIN_STEER_RPWM;  // 16
+  static const uint8_t PIN_MOT_LEN  = PIN_STEER_LEN;   // 17
+  static const uint8_t PIN_MOT_REN  = PIN_STEER_REN;   // 18
 
   static const uint32_t STEER_PWM_FREQ = 20000; // 20 kHz
   static const int      PWM_MAX         = 255;   // 8-bit
@@ -292,22 +430,26 @@ namespace Steer {
       else                             return Target::Right;
     }
   }
+
   static inline float targetDegFor(Target t){
-    switch (t){ case Target::Left:  return STEER_LEFT_DEG;
-               case Target::Right: return STEER_RIGHT_DEG;
-               default:            return STEER_CENTER_DEG; }
+    switch (t){
+      case Target::Left:  return STEER_LEFT_DEG;
+      case Target::Right: return STEER_RIGHT_DEG;
+      default:            return STEER_CENTER_DEG;
+    }
   }
 
   static void setMotor(int pwmSigned){
 #if !STEER_DRIVE_ENABLE
-    // Keep disabled for validation
+    // Disabled for validation
     analogWrite(PIN_MOT_LPWM, 0);
     analogWrite(PIN_MOT_RPWM, 0);
     digitalWrite(PIN_MOT_LEN, LOW);
     digitalWrite(PIN_MOT_REN, LOW);
     return;
 #endif
-    int mag = pwmSigned; if (mag < 0) mag = -mag;
+    int mag = pwmSigned;
+    if (mag < 0) mag = -mag;
     if (mag > 0 && mag < PWM_MIN) mag = PWM_MIN;
     if (mag > PWM_MAX) mag = PWM_MAX;
 
@@ -337,10 +479,11 @@ namespace Steer {
     SLOGF("S STEER %s\r\n", note);
   }
 
-  static inline State state(){ return g_ss; }
+  // Expose last target + values
+  static inline State  state(){ return g_ss; }
   static inline Target lastTarget(){ return g_lastTgt; }
-  static inline float lastErrorDeg(){ return g_lastErrDeg; }
-  static inline float lastTargetDeg(){ return g_lastTgtDeg; }
+  static inline float  lastErrorDeg(){ return g_lastErrDeg; }
+  static inline float  lastTargetDeg(){ return g_lastTgtDeg; }
 
   static inline float clampTarget(float wantDeg){
     const float lo = STEER_LEFT_DEG  + LIMIT_HARD_CUSHION_DEG;
@@ -349,17 +492,20 @@ namespace Steer {
     if (wantDeg > hi) return hi;
     return wantDeg;
   }
+
   static inline int softenNearStops(float curDeg, int pwmSigned){
     if (curDeg <= STEER_LEFT_DEG + LIMIT_SOFT_CUSHION_DEG && pwmSigned < 0){
       float span = LIMIT_SOFT_CUSHION_DEG - LIMIT_HARD_CUSHION_DEG;
       float x = (curDeg - (STEER_LEFT_DEG + LIMIT_HARD_CUSHION_DEG)) / span; // 0..1
-      if (x < 0) return 0; if (x > 1) x = 1;
+      if (x < 0) return 0;
+      if (x > 1) x = 1;
       return (int)(pwmSigned * x);
     }
     if (curDeg >= STEER_RIGHT_DEG - LIMIT_SOFT_CUSHION_DEG && pwmSigned > 0){
       float span = LIMIT_SOFT_CUSHION_DEG - LIMIT_HARD_CUSHION_DEG;
       float x = ((STEER_RIGHT_DEG - LIMIT_HARD_CUSHION_DEG) - curDeg) / span; // 0..1
-      if (x < 0) return 0; if (x > 1) x = 1;
+      if (x < 0) return 0;
+      if (x > 1) x = 1;
       return (int)(pwmSigned * x);
     }
     return pwmSigned;
@@ -413,7 +559,7 @@ namespace Steer {
     }
 
     float cur; noInterrupts(); cur = ::g_as_deg; interrupts();
-    float err = tgtDeg - cur;                      // +err => need to move RIGHT
+    float err = tgtDeg - cur;
     int   pwm = (int)(KP_PWM_PER_DEG * err);
 
     // Absolute “no push past” at hard cushions
@@ -423,15 +569,17 @@ namespace Steer {
     // Taper near soft zone
     pwm = softenNearStops(cur, pwm);
 
+    // Store diagnostics
     g_lastErrDeg = err;
     g_lastTgtDeg = tgtDeg;
 
-    // For transparency in UI while drive disabled
     const char* srcSteer = (g_steerSrc==SteerSrc::S1) ? "S1" : "S2";
     const char* srcThr   = (g_thrSrc  ==ThrSrc::T1)   ? "T1" : "T2";
-    SLOGF("S STEER tgt=%s(%.2f) cur=%.2f err=%.2f src=%s thr=%s drive=%s\r\n",
+
+    // Steer debug (no explicit error printed)
+    SLOGF("S STEER tgt=%s(%.2f) cur=%.2f src=%s thr=%s drive=%s\r\n",
           (tgt==Target::Left)?"L":(tgt==Target::Right)?"R":"C",
-          (double)tgtDeg, (double)cur, (double)err, srcSteer, srcThr,
+          (double)tgtDeg, (double)cur, srcSteer, srcThr,
           STEER_DRIVE_ENABLE ? "ON" : "OFF");
 
     if (fabsf(err) <= STEER_TOL_DEG || pwm == 0){
@@ -454,16 +602,24 @@ namespace Steer {
   }
 } // namespace Steer
 
-// ---- USB commands (optional small set) ----
+// ---- USB commands (optional) ----
 static void handleUsbCommandsOnce() {
   static String line;
   while (Serial.available()){
-    char c=(char)Serial.read(); if(c=='\r') continue;
+    char c=(char)Serial.read();
+    if(c=='\r') continue;
     if(c=='\n'){
       line.trim();
       if(line.length()){
-        String verb,a1; int sp1=line.indexOf(' ');
-        if(sp1<0){ verb=line; } else { verb=line.substring(0,sp1); a1=line.substring(sp1+1); a1.trim(); }
+        String verb,a1;
+        int sp1=line.indexOf(' ');
+        if(sp1<0){
+          verb=line;
+        } else {
+          verb=line.substring(0,sp1);
+          a1=line.substring(sp1+1);
+          a1.trim();
+        }
         verb.toUpperCase(); a1.toUpperCase();
 
         if (verb=="LOG"){
@@ -477,11 +633,13 @@ static void handleUsbCommandsOnce() {
         }
       }
       line="";
-    } else if(line.length()<120) line+=c;
+    } else if(line.length()<120) {
+      line+=c;
+    }
   }
 }
 
-// ===== Setup / Loop =====
+// ===== Setup =====
 void setup(){
   using namespace MM;
 
@@ -509,7 +667,27 @@ void setup(){
   OtaConsole::begin(Serial2);             // logs to ESP32 (/console)
   OtaConsole::setEnabled(true);
 
-  // Motor driver + thirds print
+  // --- Initialize M1/M2 drive outputs (all off) ---
+  pinMode(PIN_M1_R_EN,  OUTPUT);
+  pinMode(PIN_M1_L_EN,  OUTPUT);
+  pinMode(PIN_M1_L_PWM, OUTPUT);
+  pinMode(PIN_M1_R_PWM, OUTPUT);
+  pinMode(PIN_M2_R_EN,  OUTPUT);
+  pinMode(PIN_M2_L_EN,  OUTPUT);
+  pinMode(PIN_M2_L_PWM, OUTPUT);
+  pinMode(PIN_M2_R_PWM, OUTPUT);
+
+  digitalWrite(PIN_M1_R_EN,  LOW);
+  digitalWrite(PIN_M1_L_EN,  LOW);
+  analogWrite (PIN_M1_L_PWM, 0);
+  analogWrite (PIN_M1_R_PWM, 0);
+
+  digitalWrite(PIN_M2_R_EN,  LOW);
+  digitalWrite(PIN_M2_L_EN,  LOW);
+  analogWrite (PIN_M2_L_PWM, 0);
+  analogWrite (PIN_M2_R_PWM, 0);
+
+  // Steering motor driver + thirds print
   Steer::begin();
 
   // Boot banner
@@ -521,17 +699,16 @@ void setup(){
 #else
   SLOGF("UART telemetry: binary packets disabled (ASCII only)\r\n");
 #endif
+
+  SLOGF("S DRIVE M1 front pins: R_EN=%u L_EN=%u L_PWM=%u R_PWM=%u\r\n",
+        (unsigned)PIN_M1_R_EN, (unsigned)PIN_M1_L_EN,
+        (unsigned)PIN_M1_L_PWM, (unsigned)PIN_M1_R_PWM);
+  SLOGF("S DRIVE M2 rear  pins: R_EN=%u L_EN=%u L_PWM=%u R_PWM=%u\r\n",
+        (unsigned)PIN_M2_R_EN, (unsigned)PIN_M2_L_EN,
+        (unsigned)PIN_M2_L_PWM, (unsigned)PIN_M2_R_PWM);
 }
 
-static inline bool isT2Neutral(uint16_t us){
-  return (us >= (T2_NEUTRAL_CTR_US - T2_NEUTRAL_DB_US)) &&
-         (us <= (T2_NEUTRAL_CTR_US + T2_NEUTRAL_DB_US));
-}
-static inline bool isT1Neutral(uint16_t t1raw){
-  int16_t v = MM::mapT1_to_1000(t1raw);
-  return (v <= T1_NEUTRAL_DB_MAP);
-}
-
+// ===== Loop =====
 void loop(){
   using namespace MM;
 
@@ -557,8 +734,22 @@ void loop(){
     sampleAnalog();
     sampleFnr();
 
+    // ----- Throttle level classification -----
+    // T1: mapped 0..1000 using raw window [1108..3140]
+    const int16_t t1_map = mapT1_to_1000(g_t1);
+    g_t1Level = classifyThrottle01(t1_map, T1_NEUTRAL_DB_MAP);
+
+    // T2: signed around 1500 µs; direction via sign, level via |v|
+    const int16_t t2_signed = mapRcThrSigned_us_to_1000(g_t2_us);
+    g_t2Level = classifyThrottleSigned(t2_signed, THR_LVL1_MAX_01 / 10); // tiny DB, mostly from isT2Neutral
+
+    // If T2 not armed yet, treat as Off
+    if (g_thrSrc == ThrSrc::T2 && !g_t2Armed){
+      g_t2Level = 0;
+    }
+
     // ---- Control handover logic ----
-    // 1) Default S1/T1. If T2 held reverse 3s → switch both to S2/T2, require T2 neutral to arm throttle.
+    // 1) Default S1/T1. If T2 held reverse 3s → switch to S2/T2
     if (g_steerSrc == SteerSrc::S1 && g_thrSrc == ThrSrc::T1){
       if (g_t2_us <= RC_REVERSE_THRESH_US){
         if (g_rcReverseStartMs == 0) g_rcReverseStartMs = millis();
@@ -573,7 +764,7 @@ void loop(){
       }
     }
 
-    // 2) If currently on T2, require neutral pass to arm (one-shot)
+    // 2) If on T2, require neutral pass to arm
     if (g_thrSrc == ThrSrc::T2 && !g_t2Armed){
       if (isT2Neutral(g_t2_us)){
         g_t2Armed = true;
@@ -581,59 +772,81 @@ void loop(){
       }
     }
 
-    // 3) Auto-return to S1/T1 when BOTH neutral for 10 s (jitter-safe)
-    bool bothNeutral = isT1Neutral(g_t1) && isT2Neutral(g_t2_us);
-    if (bothNeutral){
-      if (g_bothNeutralStartMs == 0) g_bothNeutralStartMs = millis();
-      else if ((millis() - g_bothNeutralStartMs) >= AUTO_RETURN_MS){
-        if (g_steerSrc != SteerSrc::S1 || g_thrSrc != ThrSrc::T1){
-          g_steerSrc = SteerSrc::S1;
-          g_thrSrc   = ThrSrc::T1;
-          g_rcReverseStartMs = 0;
-          SLOGF("S SRC -> steer=S1 throttle=T1 (auto-return)\r\n");
+    // 3) Auto-return to S1/T1 when S2 and T2 are neutral 10 s (ignore S1/T1)
+    if (g_steerSrc == SteerSrc::S2 && g_thrSrc == ThrSrc::T2) {
+      bool rcBothNeutral = isS2Neutral(g_s2_us) && isT2Neutral(g_t2_us);
+      if (rcBothNeutral){
+        if (g_rcNeutralStartMs == 0) g_rcNeutralStartMs = millis();
+        else if ((millis() - g_rcNeutralStartMs) >= AUTO_RETURN_MS){
+          if (g_steerSrc != SteerSrc::S1 || g_thrSrc != ThrSrc::T1){
+            g_steerSrc = SteerSrc::S1;
+            g_thrSrc   = ThrSrc::T1;
+            g_rcReverseStartMs = 0;
+            g_t2Armed = false;
+            g_t2Level = 0;
+            SLOGF("S SRC -> steer=S1 throttle=T1 (auto-return S2/T2 idle)\r\n");
+          }
         }
+      } else {
+        g_rcNeutralStartMs = 0;
       }
     } else {
-      g_bothNeutralStartMs = 0;
+      g_rcNeutralStartMs = 0;
     }
 
-    // Maps just for the console line (helps visualize)
+    // Maps for visualization
     const int16_t s2_map = mapRcSteer_us_to_1000(g_s2_us);
     const int16_t t2_map = mapRcThr_us_to_1000(g_t2_us);
-    const int16_t t1_map = mapT1_to_1000(g_t1);
 
-    // Angle snapshot (optional in RAW line)
+    // Angle snapshot
     uint16_t as_raw = 0;
     float    as_deg = 0.0f;
     const bool haveAngle = angleSnapshot(as_raw, as_deg);
 
+    // Steering target deg + label
+    const float steerTgtDeg = Steer::lastTargetDeg();
+    const char* steerTgtLabel;
+    switch (Steer::lastTarget()) {
+      case Steer::Target::Left:   steerTgtLabel = "LEFT";   break;
+      case Steer::Target::Right:  steerTgtLabel = "RIGHT";  break;
+      default:                    steerTgtLabel = "CENTER"; break;
+    }
+
 #if RAW_MIRROR_MODE
     if (haveAngle) {
-      SLOGF("S RAW S1=%u  T1=%u(%d)  S2_us=%d(%d)  T2_us=%d(%d)  AS=%u(%.2f)  FNR=%s  SRC=%s/%s %s\r\n",
-            (unsigned)g_s1,
-            (unsigned)g_t1, (int)t1_map,
-            (int)g_s2_us, (int)s2_map,
-            (int)g_t2_us, (int)t2_map,
-            (unsigned)as_raw, (double)as_deg,
-            fnrWord(g_fnr),
-            (g_steerSrc==SteerSrc::S1)?"S1":"S2",
-            (g_thrSrc  ==ThrSrc::T1)  ?"T1":"T2",
-            (g_thrSrc==ThrSrc::T2 ? (g_t2Armed?"ARMED":"UNARMED") : ""));
+      SLOGF(
+        "S RAW S1=%u  T1=%u(%d,Lv%d)  S2_us=%d(%d)  T2_us=%d(%d,Lv%d)  "
+        "AS=%u(%.2f)  ST=cur=%.2f tgt=%s(%.2f)  FNR=%s  SRC=%s/%s %s\r\n",
+        (unsigned)g_s1,
+        (unsigned)g_t1, (int)t1_map, (int)g_t1Level,
+        (int)g_s2_us, (int)s2_map,
+        (int)g_t2_us, (int)t2_map, (int)g_t2Level,
+        (unsigned)as_raw, (double)as_deg,
+        (double)as_deg, steerTgtLabel, (double)steerTgtDeg,
+        fnrWord(g_fnr),
+        (g_steerSrc==SteerSrc::S1)?"S1":"S2",
+        (g_thrSrc  ==ThrSrc::T1)  ?"T1":"T2",
+        (g_thrSrc==ThrSrc::T2 ? (g_t2Armed?"ARMED":"UNARMED") : "")
+      );
     } else {
-      SLOGF("S RAW S1=%u  T1=%u(%d)  S2_us=%d(%d)  T2_us=%d(%d)  AS=---  FNR=%s  SRC=%s/%s %s\r\n",
-            (unsigned)g_s1,
-            (unsigned)g_t1, (int)t1_map,
-            (int)g_s2_us, (int)s2_map,
-            (int)g_t2_us, (int)t2_map,
-            fnrWord(g_fnr),
-            (g_steerSrc==SteerSrc::S1)?"S1":"S2",
-            (g_thrSrc  ==ThrSrc::T1)  ?"T1":"T2",
-            (g_thrSrc==ThrSrc::T2 ? (g_t2Armed?"ARMED":"UNARMED") : ""));
+      SLOGF(
+        "S RAW S1=%u  T1=%u(%d,Lv%d)  S2_us=%d(%d)  T2_us=%d(%d,Lv%d)  "
+        "AS=---  ST=cur=--- tgt=%s(%.2f)  FNR=%s  SRC=%s/%s %s\r\n",
+        (unsigned)g_s1,
+        (unsigned)g_t1, (int)t1_map, (int)g_t1Level,
+        (int)g_s2_us, (int)s2_map,
+        (int)g_t2_us, (int)t2_map, (int)g_t2Level,
+        steerTgtLabel, (double)steerTgtDeg,
+        fnrWord(g_fnr),
+        (g_steerSrc==SteerSrc::S1)?"S1":"S2",
+        (g_thrSrc  ==ThrSrc::T1)  ?"T1":"T2",
+        (g_thrSrc==ThrSrc::T2 ? (g_t2Armed?"ARMED":"UNARMED") : "")
+      );
     }
 #endif
   }
 
-  // ~50 Hz steering control loop (drive currently disabled)
+  // ~50 Hz steering control loop
   static uint32_t t_ctrl = 0;
   if (micros() - t_ctrl >= 20000){
     t_ctrl = micros();
@@ -641,9 +854,12 @@ void loop(){
   }
 
   // Blink
-  static uint32_t t_led=0; static bool led=false;
+  static uint32_t t_led=0;
+  static bool led=false;
   if (millis() - t_led >= BLINK_MS){
-    t_led = millis(); led = !led; digitalWrite(LED_PIN, led? HIGH:LOW);
+    t_led = millis();
+    led = !led;
+    digitalWrite(LED_PIN, led? HIGH:LOW);
   }
 
   handleUsbCommandsOnce();
